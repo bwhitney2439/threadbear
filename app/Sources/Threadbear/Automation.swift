@@ -217,6 +217,13 @@ enum Automation {
         }
         let shown: String
         if let settings = app.runnerSettings {
+            // Built apart, with types, so older Swift compilers type-check the dictionary in time.
+            let pools: [String] = app.pools.map { pool in
+                let folders: String = pool.folders.isEmpty ? "" : " [" + pool.folders.joined(separator: ", ") + "]"
+                return "\(pool.id) \"\(pool.title)\": " + pool.accountIds.joined(separator: ", ") + folders
+            }
+            let devices: [String] = app.devices.map { "\($0.kind.rawValue) \"\($0.name)\": \(DeviceText.detail($0))" }
+            let pairingShown: Bool = SettingsWindow.current?.attachedSheet != nil
             shown = json([
                 "tab": app.settingsTab.rawValue,
                 "defaultCwd": settings.defaultCwd,
@@ -229,15 +236,15 @@ enum Automation {
                 "smallJobsPool": settings.models.pool ?? "",
                 "privateFolders": settings.models.privateFolders,
                 "error": app.settingsError ?? "",
-                "pools": app.pools.map { "\($0.id) \"\($0.title)\": " + $0.accountIds.joined(separator: ", ") + ($0.folders.isEmpty ? "" : " [" + $0.folders.joined(separator: ", ") + "]") },
+                "pools": pools,
                 "poolsError": app.poolsError ?? "",
                 // The Phone & browser tab: each paired device as one line,
                 // the website, and why nothing can pair when sync is off.
-                "devices": app.devices.map { "\($0.kind.rawValue) \"\($0.name)\": \(DeviceText.detail($0))" },
+                "devices": devices,
                 "devicesSite": app.devicesSite ?? "",
                 "devicesReason": app.devicesReason ?? "",
                 "devicesError": app.devicesError ?? "",
-                "pairingShown": SettingsWindow.current?.attachedSheet != nil,
+                "pairingShown": pairingShown,
             ] as [String: Any])
         } else {
             shown = json(["tab": app.settingsTab.rawValue, "unsupported": app.settingsUnsupported] as [String: Any])
