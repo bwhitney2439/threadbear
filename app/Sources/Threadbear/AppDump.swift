@@ -938,6 +938,39 @@ struct AppDump: Encodable {
         let key = app.selection ?? "new"
         let transcript = transcriptInfo(app.transcript)
         let appearance = window?.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? "dark" : "light"
+        // Worked out apart, with types: Swift 6.2.4 can't type-check them inside AppDump(...) in time.
+        let projectDump: ProjectInfo? = app.openProject.map { project in
+            let threads = ProjectSections.threads(in: project.id, from: app.threads.values)
+            return ProjectInfo(id: project.id, title: project.title,
+                               parent: project.parentId.flatMap { app.project($0)?.title },
+                               parts: (app.projectSections.parts[project.id] ?? []).map(\.project.title),
+                               tab: app.projectDecisionsOn ? app.projectTab(project.id).rawValue : nil,
+                               folders: project.folders, threads: threads.map(\.id),
+                               patches: PatchGroups.patches(of: project, in: threads).map(\.patch.id), archived: project.archived)
+        }
+        let projectCardsDump: [String]? = app.openProject == nil && app.showsProjectsHome ? app.projectCards.map { card -> String in
+            let status: String = card.status.isQuiet ? "quiet" : card.status.parts.map(\.text).joined(separator: " · ")
+            let parts: String = card.parts.isEmpty ? "" : " (parts: \(card.parts.map(\.title).joined(separator: ", ")))"
+            return "\(card.project.title): \(status)\(parts)"
+        } : nil
+        let settingsWindowDump: SettingsWindowInfo? = SettingsWindow.current?.isVisible == true ? SettingsWindowInfo(
+            tab: app.settingsTab.rawValue, appearance: UserDefaults.standard.string(forKey: AppAppearance.key) ?? "system",
+            defaultFolder: app.runnerSettings?.defaultCwd, keepAwake: app.runnerSettings?.keepAwake, labReview: app.runnerSettings?.labReview,
+            privateFolders: app.runnerSettings?.models.privateFolders, smallJobsPool: app.runnerSettings?.models.pool,
+            runners: runnersInfo(app), devices: devicesInfo(app), keyboard: keyboardInfo()) : nil
+        let poolsDump: [PoolInfo] = app.usesPools ? app.pools.map { pool in
+            PoolInfo(id: pool.id, title: pool.title, logins: pool.accountIds, folders: pool.folders,
+                     rail: Pools.railSubtitle(pool, accounts: app.accounts), status: Pools.statusLine(pool, accounts: app.accounts, now: app.now))
+        } : []
+        let panelMotionDump: PanelMotion? = app.dock.motionFrom.map { from in
+            func rects(_ frames: [String: CGRect]) -> [String: PanelMotion.Rect] {
+                Dictionary(frames.map { ($0.key.replacingOccurrences(of: "threadbear.", with: ""), PanelMotion.Rect(x: $0.value.minX.rounded(), y: $0.value.minY.rounded(), width: $0.value.width.rounded(), height: $0.value.height.rounded())) }, uniquingKeysWith: { a, _ in a })
+            }
+            return PanelMotion(from: rects(from), to: rects(app.dock.panelFrames))
+        }
+        let actionsDump: [ActionInfo] = app.selectedThread.map { thread in
+            thread.actions.map { ActionInfo(id: $0.id, title: $0.title, kind: $0.kind.rawValue, running: app.isRunning(action: $0, in: thread.id)) }
+        } ?? []
         return AppDump(
             instance: instance,
             connection: connectionName(app.connection),
@@ -955,9 +988,7 @@ struct AppDump: Encodable {
             selection: app.selectedThread.map { thread($0) },
             subagent: app.subagentSelection?.subagentId,
             panels: app.selectedThread.flatMap { panels($0, app: app) },
-            actions: app.selectedThread.map { thread in
-                thread.actions.map { ActionInfo(id: $0.id, title: $0.title, kind: $0.kind.rawValue, running: app.isRunning(action: $0, in: thread.id)) }
-            } ?? [],
+            actions: actionsDump,
             composer: composer(app, key: key),
             newThread: newThreadPageDump(app),
             palette: slashPalette,
@@ -965,39 +996,16 @@ struct AppDump: Encodable {
             decisions: app.selectedThread.flatMap { decisions($0, app: app) },
             transcript: transcript,
             usage: usage(app),
-            project: app.openProject.map { project in
-                let threads = ProjectSections.threads(in: project.id, from: app.threads.values)
-                return ProjectInfo(id: project.id, title: project.title,
-                                   parent: project.parentId.flatMap { app.project($0)?.title },
-                                   parts: (app.projectSections.parts[project.id] ?? []).map(\.project.title),
-                                   tab: app.projectDecisionsOn ? app.projectTab(project.id).rawValue : nil,
-                                   folders: project.folders, threads: threads.map(\.id),
-                                   patches: PatchGroups.patches(of: project, in: threads).map(\.patch.id), archived: project.archived)
-            },
+            project: projectDump,
             projectDecisions: app.openProject.flatMap { projectDecisionLines($0, app: app) },
-            projectCards: app.openProject == nil && app.showsProjectsHome ? app.projectCards.map { card in
-                card.project.title + ": " + (card.status.isQuiet ? "quiet" : card.status.parts.map(\.text).joined(separator: " · "))
-                    + (card.parts.isEmpty ? "" : " (parts: " + card.parts.map(\.title).joined(separator: ", ") + ")")
-            } : nil,
+            projectCards: projectCardsDump,
             homePage: homePageDump(app),
             scheduleEditor: app.scheduleEditor.map { ScheduleEditorInfo(isNew: $0.isNew, text: $0.text, once: $0.once, cron: $0.once ? nil : $0.repeatChoice.cron) },
-            settingsWindow: SettingsWindow.current?.isVisible == true ? SettingsWindowInfo(
-                tab: app.settingsTab.rawValue, appearance: UserDefaults.standard.string(forKey: AppAppearance.key) ?? "system",
-                defaultFolder: app.runnerSettings?.defaultCwd, keepAwake: app.runnerSettings?.keepAwake, labReview: app.runnerSettings?.labReview,
-                privateFolders: app.runnerSettings?.models.privateFolders, smallJobsPool: app.runnerSettings?.models.pool,
-                runners: runnersInfo(app), devices: devicesInfo(app), keyboard: keyboardInfo()) : nil,
+            settingsWindow: settingsWindowDump,
             librarian: app.librarian.map(LibrarianText.state),
-            pools: app.usesPools ? app.pools.map { pool in
-                PoolInfo(id: pool.id, title: pool.title, logins: pool.accountIds, folders: pool.folders,
-                         rail: Pools.railSubtitle(pool, accounts: app.accounts), status: Pools.statusLine(pool, accounts: app.accounts, now: app.now))
-            } : [],
+            pools: poolsDump,
             dock: app.dock.layout.summary.replacingOccurrences(of: "threadbear.", with: ""),
-            panelMotion: app.dock.motionFrom.map { from in
-                func rects(_ frames: [String: CGRect]) -> [String: PanelMotion.Rect] {
-                    Dictionary(frames.map { ($0.key.replacingOccurrences(of: "threadbear.", with: ""), PanelMotion.Rect(x: $0.value.minX.rounded(), y: $0.value.minY.rounded(), width: $0.value.width.rounded(), height: $0.value.height.rounded())) }, uniquingKeysWith: { a, _ in a })
-                }
-                return PanelMotion(from: rects(from), to: rects(app.dock.panelFrames))
-            },
+            panelMotion: panelMotionDump,
             threadsShowing: app.threadsShowing,
             threadPanels: threadPanels(app),
             openElsewhere: app.selection.flatMap { id in
