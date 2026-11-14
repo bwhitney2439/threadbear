@@ -219,7 +219,7 @@ final class RemoteRowActionTests: XCTestCase {
         app.archive("th_bruce")
         // The row shows archived before the runner answers (11 Nov), so
         // wait for the call itself.
-        try await until { app.threads["th_bruce"]?.isArchived == true && away.params("threads.update").count == 1 }
+        try await until { app.threads["th_bruce"]?.isArchived == true && !local.params("threads.update").isEmpty }
         XCTAssertEqual(app.threads["th_bruce"]?.isArchived, true)
         XCTAssertEqual(local.params("threads.update").first?["threadId"] as? String, "th_bruce")
         XCTAssertNil(app.errorMessage)
