@@ -413,10 +413,11 @@ struct PictureOnMac: View {
 struct WebPictureLink: View {
     var alt: String
     var url: URL
-    @Environment(\.openURL) private var openURL
 
     var body: some View {
-        Button { openURL(url) } label: {
+        // A Link goes through the openURL the thread sets, so LinkGate (or
+        // the thread's own links) decides, as for any link in a reply.
+        Link(destination: url) {
             PictureOnMac(alt: alt, note: "Picture on \(url.host() ?? "the web"), not loaded. Tap to open it.")
         }
         .buttonStyle(.plain)
