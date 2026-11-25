@@ -13,15 +13,31 @@ import type { Id } from './_generated/dataModel';
 import { MAX_RUNNER_UPLOAD_BYTES } from './sync';
 import { PHONE_UPLOADS } from './phone';
 import { takeUpload } from './uploads';
+import { safeDecode, withCard } from './shareCard';
+import { promoteRoute } from './boxImage';
 
 const http = httpRouter();
+
+// No other site may put these pages in a frame. Framed out of sight, a
+// thread's link and then the Open button of the website's own "Open this in
+// another app?" question (web/src/link-confirm.tsx) could be clicked through
+// a page laid over them, the address never seen: a shared page (/s/) needs
+// no sign-in for that (Daybreak 139, cross-lab review, 17 Nov 2026).
+// frame-ancestors has to be a header; a <meta> CSP ignores it.
+export const NO_FRAMES = { 'X-Frame-Options': 'DENY', 'Content-Security-Policy': "frame-ancestors 'none'" } as const;
+
+export function noFrames(response: Response): Response {
+  const headers = new Headers(response.headers);
+  for (const [k, value] of Object.entries(NO_FRAMES)) headers.set(k, value);
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
 
 http.route({
   pathPrefix: '/s/',
   method: 'GET',
   handler: httpAction(async (ctx, request) => {
     const url = new URL(request.url);
-    const slug = decodeURIComponent(url.pathname.slice('/s/'.length).replace(/\/$/, ''));
+    const slug = safeDecode(url.pathname.slice('/s/'.length).replace(/\/$/, ''));
     const asset = await ctx.runQuery(components.staticHosting.lib.resolveAssetForHttp, { path: '/index.html' });
     // The page is in one of the three places the component keeps files
     // (registerStaticRoutes reads them the same way).
@@ -38,6 +54,7 @@ http.route({
         // Sharing can stop at any time; a cached card would outlive it.
         'Cache-Control': 'no-store',
         'X-Content-Type-Options': 'nosniff',
+        ...NO_FRAMES,
       },
     });
   }),
@@ -94,13 +111,17 @@ http.route({
   }),
 });
 
+// The box-image workflow promoting the image a new box boots, with a GitHub
+// Actions OIDC token (boxImage.ts says what it checks).
+http.route({ path: '/box-image/promote', method: 'POST', handler: promoteRoute });
+
 // The three upload routes below take their one-use ticket the same way
 // (uploads.ts takeUpload): claimed before the body is read, the body read
 // no further than the cap, and a file the finish doesn't keep deleted.
 
 // A runner key's uploads (sync:iconUploadUrl hands out this URL with a
 // one-use ticket): the file is stored here and recorded as that runner's,
-// so its key can attach it, and only it (docs/protocol.md, "Runner keys").
+// so its key can attach it, and only it (docs/protocol/keys.md, "Runner keys").
 // Answers { storageId } as Convex's own upload URL does, so the runner's
 // uploader is the same for both. 429: over an allowance, try again later;
 // 403: this ticket won't do.
@@ -137,35 +158,26 @@ http.route({
   ),
 });
 
-registerStaticRoutes(http, components.staticHosting);
+// The site's own pages go out with NO_FRAMES too. registerStaticRoutes has
+// no option for headers, so it registers onto this stand-in router, which
+// wraps each handler it's given (an httpAction's _handler is the function it
+// was made from).
+registerStaticRoutes(
+  {
+    route: (spec: Parameters<typeof http.route>[0]) => {
+      const inner = (spec.handler as unknown as { _handler?: (ctx: unknown, request: Request) => Promise<Response> })._handler;
+      // A newer Convex without _handler fails the deploy here, rather than
+      // serving pages without the header.
+      if (typeof inner !== 'function') throw new Error("static-hosting's handler can't be wrapped: NO_FRAMES needs another way in");
+      http.route({ ...spec, handler: httpAction(async (ctx, request) => noFrames(await inner(ctx, request))) });
+    },
+  } as unknown as typeof http,
+  components.staticHosting,
+);
 
 export default http;
-
-// index.html with the thread's title and Open Graph and Twitter card tags.
-export function withCard(html: string, card: { title: string; description: string; image?: string }, url: URL): string {
-  const e = escapeHtml;
-  const tags = [
-    `<meta property="og:type" content="article" />`,
-    `<meta property="og:site_name" content="Threadbear" />`,
-    `<meta property="og:title" content="${e(card.title)}" />`,
-    `<meta property="og:url" content="${e(url.origin + url.pathname)}" />`,
-    card.description ? `<meta property="og:description" content="${e(card.description)}" />` : '',
-    card.description ? `<meta name="description" content="${e(card.description)}" />` : '',
-    `<meta property="og:image" content="${e(card.image ?? `${url.origin}/icon.png`)}" />`,
-    `<meta name="twitter:card" content="${card.image ? 'summary_large_image' : 'summary'}" />`,
-    `<meta name="twitter:title" content="${e(card.title)}" />`,
-    card.description ? `<meta name="twitter:description" content="${e(card.description)}" />` : '',
-  ]
-    .filter(Boolean)
-    .join('\n    ');
-  return html.replace(/<title>[^<]*<\/title>/, `<title>${e(card.title)} · Threadbear</title>\n    ${tags}`);
-}
 
 async function text(response: Promise<Response>): Promise<string | null> {
   const r = await response;
   return r.ok ? r.text() : null;
-}
-
-function escapeHtml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }

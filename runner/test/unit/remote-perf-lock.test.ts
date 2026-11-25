@@ -2,17 +2,21 @@
 // paths and real locks, without any build, GUI, network or installed runner.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { closedTmpParent } from '../helpers/closed-tmp.ts';
 
 const root = path.resolve(import.meta.dirname, '../../..');
+// Only there to catch a hang, as in remote-cache.test.ts: a run takes a few
+// seconds alone, but at a load of 30+ (18 Nov) one took more than 15 s and
+// was killed mid-way, and at 60+ some took over 100 s (Seth, 1d64f3eca).
+const STUCK = 240_000;
 
 for (const mode of ['ordinary', 'perf', 'try', 'try-env', 'busy-copy', 'busy-run']) test(`remote.sh host leases: ${mode}`, async (t) => {
   const perf = mode === 'perf';
   const tryOnly = mode === 'try' || mode.startsWith('busy-');
-  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'tb-remote-perf-'));
+  const work = fs.mkdtempSync(path.join(closedTmpParent(), '.tb-remote-perf-'));
   t.after(() => fs.rmSync(work, { recursive: true, force: true }));
   const home = path.join(work, 'home');
   const bin = path.join(work, 'bin');
@@ -23,7 +27,7 @@ for (const mode of ['ordinary', 'perf', 'try', 'try-env', 'busy-copy', 'busy-run
   let holder: ReturnType<typeof spawn> | undefined;
   async function hold() {
     fs.mkdirSync(path.join(home, '.cache'), { recursive: true });
-    holder = spawn('perl', ['-MFcntl=:flock', '-e', 'open(my $f, ">>", $ARGV[0]) or die $!; flock($f, LOCK_EX) or die $!; $|=1; print "held\\n"; sleep 60', path.join(home, '.cache/threadbear-perf.lock')]);
+    holder = spawn('perl', ['-MFcntl=:flock', '-e', 'open(my $f, ">>", $ARGV[0]) or die $!; flock($f, LOCK_EX) or die $!; $|=1; print "held\\n"; sleep 600', path.join(home, '.cache/threadbear-perf.lock')]);
     t.after(() => holder?.kill());
     await new Promise((r) => holder!.stdout!.once('data', r));
   }
@@ -38,7 +42,7 @@ for name in perf-lock.pl perf-children.pl hangup-guard.sh remote-guard-lib.sh bu
   [ ! -f "$src/scripts/$name" ] || cp "$src/scripts/$name" "$dest/scripts/"
 done
 cp "$src/runner/scripts/find-node.sh" "$dest/runner/scripts/"
-for dir in features app/Tools/mock-runner runner; do mkdir -p "$dest/$dir/node_modules"; done
+for dir in features mock-runner runner; do mkdir -p "$dest/$dir/node_modules"; done
 ${mode === 'busy-run' ? 'touch "$HOME/start-holder"\nwhile [ ! -f "$HOME/holder-ready" ]; do sleep 0.02; done' : ''}
 `, { mode: 0o755 });
   // df is called during heavy cache trimming and again after the command.
@@ -59,10 +63,10 @@ echo 'fake 0 0 41943040 0% /'
   child.stdout!.on('data', (s) => { output += s; });
   child.stderr!.on('data', (s) => { output += s; });
   const done = new Promise((r) => child.on('exit', r));
-  const timeout = setTimeout(() => child.kill('SIGTERM'), 15_000);
+  const timeout = setTimeout(() => child.kill('SIGTERM'), STUCK);
   t.after(() => clearTimeout(timeout));
   if (mode === 'busy-run') {
-    const end = Date.now() + 10_000;
+    const end = Date.now() + STUCK;
     while (!fs.existsSync(path.join(home, 'start-holder'))) {
       assert.ok(Date.now() < end, output);
       await new Promise((r) => setTimeout(r, 20));

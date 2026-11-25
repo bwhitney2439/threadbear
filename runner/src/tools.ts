@@ -1,10 +1,10 @@
-import fs from 'node:fs';
 import path from 'node:path';
 import type { Hunk, PlanEntry, ToolKind } from './protocol.ts';
 import { MAYBE_RUNS_AS_CODE, RUNS_AS_CODE, type CodeWrite } from './code-writes.ts';
 import { LIMITS } from './protocol.ts';
 import { applyReplace, diffLines } from './diff.ts';
 import { firstLineSafely, safeEnd } from './safe-cut.ts';
+import { realPathSync } from './platform.ts';
 
 const KINDS: Record<string, ToolKind> = {
   Bash: 'command',
@@ -81,7 +81,7 @@ function realCwd(cwd: string): string {
   let r = realpaths.get(cwd);
   if (r === undefined) {
     try {
-      r = fs.realpathSync(cwd);
+      r = realPathSync(cwd);
     } catch {
       r = cwd;
     }
@@ -205,9 +205,8 @@ export function truncateInput(input: unknown): Record<string, unknown> {
     }
     if (depth > 8 || v === null || typeof v !== 'object') return v;
     if (Array.isArray(v)) return v.map((x) => walk(x, depth + 1));
-    const out: Record<string, unknown> = {};
-    for (const [k, x] of Object.entries(v)) out[k] = walk(x, depth + 1);
-    return out;
+    // fromEntries, so a key named __proto__ stays an own key of the copy.
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x, depth + 1)]));
   };
   const r = walk(input ?? {}, 0);
   return r && typeof r === 'object' && !Array.isArray(r) ? (r as Record<string, unknown>) : { value: r };
@@ -245,6 +244,14 @@ export function cardInput(input: Record<string, unknown>, decisive: readonly str
     if (Array.isArray(v)) return v.map((x, i) => whole(x, `${where}[${i}]`, depth + 1));
     return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, whole(x, `${where}.${k}`, depth + 1)]));
   };
+  // An argument named __proto__ (legal JSON, an own key of what JSON.parse
+  // makes) can't be copied onto a plain object as its own: it would set the
+  // copy's prototype and go missing from the card while Allow passed it on.
+  // Refused like one too long to show, for every adapter and queued call
+  // (Daybreak finding 176).
+  // Nested ones too (Gemini's review): a copy made anywhere on the way to a
+  // screen with plain assignment would lose them the same way.
+  if (hasProtoKey(input)) return { input: {}, tooLong: UNSHOWABLE_KEY };
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(input ?? {})) {
     out[k] = decisive === 'all' || decisive.includes(k) ? whole(v, k, 1) : truncateInput({ v }).v;
@@ -262,11 +269,18 @@ export function cardInput(input: Record<string, unknown>, decisive: readonly str
 export const REMOTE_COMMAND_CHARS = 160;
 // What such a card says there, and what an allow from there is told.
 export const REMOTE_ALLOW_REFUSED = "It can't be shown in full here, so it can only be allowed in the Mac app connected straight to its runner.";
+// The same, naming the runner, for a card's title (sync.ts). A runner puts
+// such a card up only while it has an app of its own (app-seen.ts), so the
+// app it names is one there is.
+export function remoteAllowRefused(runnerName?: string): string {
+  return runnerName ? `It can't be shown in full here, so only the Threadbear app on ${runnerName} can allow it.` : REMOTE_ALLOW_REFUSED;
+}
 // `cwd` is the thread's folder: a command that runs anywhere else, or asks
 // for the network, has more to it than its line (Codex review, 7 Nov 2026).
 // An edit of a file that runs as code shows all it writes on the Mac, and
 // only its path here (its title says it is one), so it counts too.
 export function remoteCardShowsAll(name: string, input: Record<string, unknown>, cwd?: string, title = ''): boolean {
+  if (hasProtoKey(input)) return false;
   if (name === 'permissions' || title.includes(RUNS_AS_CODE) || title.includes(MAYBE_RUNS_AS_CODE)) return false;
   // A file edit shows only its path there, and Allow writes all of it: the
   // Mac's card shows every line, so only the Mac allows one (Mike chose
@@ -352,7 +366,20 @@ export function summaryField(input: Record<string, unknown>): string | undefined
 }
 
 // What the agent is told when a call is refused for that.
+const UNSHOWABLE_KEY = '__proto__';
+
+// Whether a call's input has an own key named __proto__ anywhere in it (or
+// is nested too deep to tell).
+export function hasProtoKey(v: unknown, depth = 0): boolean {
+  if (v === null || typeof v !== 'object') return false;
+  if (depth > 32) return true;
+  if (Array.isArray(v)) return v.some((x) => hasProtoKey(x, depth + 1));
+  if (Object.hasOwn(v, '__proto__')) return true;
+  return Object.values(v).some((x) => hasProtoKey(x, depth + 1));
+}
+
 export function tooLongForCard(where: string): string {
+  if (where === UNSHOWABLE_KEY) return "Not run: the call had an argument named __proto__, which an approval card can't show, and the user can only allow what they can read.";
   return `Not run: \`${where}\` is longer than an approval card shows in full (${Math.round(LIMITS.toolInputString / 1024)} KB), and the user can only allow what they can read. Split it into shorter steps.`;
 }
 

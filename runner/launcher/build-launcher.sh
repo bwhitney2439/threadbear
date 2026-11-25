@@ -89,9 +89,11 @@ COMMIT="$(git -C "$HERE" rev-parse HEAD 2>/dev/null || true)"
 printf '{\n  "sources": "%s",\n  "commit": "%s",\n  "builtAt": "%s"\n}\n' \
   "$(sources_hash)" "$COMMIT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STAGE_DIR/Contents/Resources/build.json"
 
+# A revoked certificate is still listed, marked CSSMERR_TP_CERT_REVOKED, and
+# codesign fails with it, so it's passed over.
 SIGN_IDENTITY="${THREADBEAR_SIGN_IDENTITY:-$({
   security find-identity -v -p codesigning 2>/dev/null \
-    | awk '/"Apple Development:/ { print $2; exit }'
+    | awk '/"Apple Development:/ && !/CSSMERR_/ { print $2; exit }'
 } || true)}"
 SIGNING_REQUIREMENTS=()
 if [ -z "$SIGN_IDENTITY" ]; then
@@ -104,8 +106,11 @@ codesign --remove-signature "$STAGE_DIR/Contents/MacOS/$APP_NAME" 2>/dev/null ||
 codesign --force --timestamp=none --sign "$SIGN_IDENTITY" \
   ${SIGNING_REQUIREMENTS[@]+"${SIGNING_REQUIREMENTS[@]}"} "$STAGE_DIR" >/dev/null
 
-# Two renames: the old app is gone for an instant, never half there. A
-# running launcher keeps its old executable open, so it isn't disturbed.
+# Two renames: the old app is gone for an instant, never half there. Never
+# build over the app a running launcher started from: it keeps running, but
+# macOS can no longer check it against its bundle, so every privacy grant
+# asked for under it fails until it restarts (15 Nov 2026).
+# install-runner.sh builds beside it instead (.<name>.staged).
 rm -rf "$OLD_DIR"
 if [ -e "$FINAL_DIR" ]; then mv "$FINAL_DIR" "$OLD_DIR"; fi
 mv "$STAGE_DIR" "$FINAL_DIR"

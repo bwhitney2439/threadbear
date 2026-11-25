@@ -1,5 +1,3 @@
-import path from 'node:path';
-import fs from 'node:fs';
 // One thread, read three ways, to check they agree (scenarios.test.ts):
 //
 //   here    this runner's own events and summary, as the Mac app reads them
@@ -14,13 +12,15 @@ import fs from 'node:fs';
 // rebuild of a card) shows as the routes disagreeing, not as a bug on Alex's
 // backend. Nothing here touches the network or a model, so it's as quick and
 // steady as a unit test.
+import fs from 'node:fs';
+import path from 'node:path';
 import { makeHarness } from './fakes.ts';
 import { call, load, memoryBackend } from './convex-memory.ts';
 import { ConvexSync } from '../../src/sync.ts';
 import { Relay } from '../../src/relay.ts';
 import { nullLogger } from '../../src/log.ts';
 import type { ImageRef, LabReviewLedger } from '../../src/protocol.ts';
-import type { Post } from '../../src/sync.ts';
+import type { Post, Upload } from '../../src/sync.ts';
 
 const OWNER = 'owner-key';
 const TOKEN = 'phone-token';
@@ -33,7 +33,7 @@ export type View = {
   needs?: string;
   asks: Ask[];
   next: string[];
-  // The done card's loose ends (experiment looseEnds), as their words.
+  // The done card's loose ends, as their words.
   looseEnds: string[];
   // Review by another lab's ledger on the last turn's card.
   review?: unknown;
@@ -47,6 +47,9 @@ export type View = {
   // "The last turn failed"): a signed-out login on bruce read as an empty
   // reply on this Mac (canary, 13 Nov).
   failed: boolean;
+  // What it's waiting on (docs/protocol/needs-you.md, "Wait state"): the
+  // section, badge and order every app draws it with.
+  waitState?: string;
 };
 
 export type Play = {
@@ -75,6 +78,10 @@ export type Play = {
   earlyStop(): void;
   /** The thread's login ran out and the runner moved it to another (runner/pools.ts moveLogin). */
   loginMoved(): void;
+  /** The quiet inbox archives the finished thread, as Opus guessed it a skip (runner/inbox-guess.ts quietArchive, experiment quietInboxMine). */
+  quietlyArchived(why: string): void;
+  /** Alex brings it back with "Should have shown me" (threads.update's unarchive verdict). */
+  shouldHaveShown(): void;
 };
 
 export async function threeWays(play: (p: Play) => void | Promise<void>) {
@@ -84,26 +91,48 @@ export async function threeWays(play: (p: Play) => void | Promise<void>) {
   const b = memoryBackend();
   const mods: Record<string, Record<string, any>> = { sync: load('sync'), relay: load('relay'), phone: load('phone') };
   const refused: string[] = [];
-  const post = async (_kind: string, fn: string, args: Record<string, unknown>) => {
+  // One function at a time, as a deployment runs them: each is a
+  // transaction there, and here two interleaved at their awaits could both
+  // find a row missing and both write it. The runner now syncs while the
+  // thread plays (playInto), so its flushes can overlap.
+  let last: Promise<unknown> = Promise.resolve();
+  const post = (_kind: string, fn: string, args: Record<string, unknown>) => {
     const [m, name] = fn.split(':');
     const f = mods[m!]?.[name!];
-    if (!f) throw new Error(`routes: no backend function ${fn}`);
-    try {
-      return await call(b.ctx, f, args);
-    } catch (e) {
-      // The runner retries or skips what fails; the scenario says so.
-      refused.push(`${fn}: ${String((e as Error)?.message ?? e)}`);
-      throw e;
-    }
+    const run = last.then(async () => {
+      if (!f) throw new Error(`routes: no backend function ${fn}`);
+      try {
+        return await call(b.ctx, f, args);
+      } catch (e) {
+        // The runner retries or skips what fails; the scenario says so.
+        refused.push(`${fn}: ${String((e as Error)?.message ?? e)}`);
+        throw e;
+      }
+    });
+    last = run.catch(() => {});
+    return run;
   };
-  const { h, sync, ids } = await playInto(post as never, { key: OWNER, runnerId: RUNNER, name: 'mac-mini' }, [play]);
+  // File storage: what the runner uploads is kept, so the backend has a URL
+  // for it (convex-memory.ts getUrl) and another Mac's runner can fetch it by that.
+  const stored = new Map<string, Uint8Array>();
+  const upload: Upload = async (_url, bytes) => {
+    const id = b.file(`st${stored.size + 1}`);
+    stored.set(id, bytes);
+    return id;
+  };
+  const download = async (url: string) => {
+    const bytes = stored.get(url.replace('https://files.example/', ''));
+    if (!bytes) throw new Error(`routes: nothing stored at ${url}`);
+    return bytes;
+  };
+  const { h, sync, ids } = await playInto(post as never, { key: OWNER, runnerId: RUNNER, name: 'mac-mini' }, [play], upload);
   const thread = { id: ids[0]! };
 
   const id = thread.id;
   const at = new Date(h.clock.now()).toISOString();
   const remote = () => ({ runners: [{ id: RUNNER, name: 'mac-mini', online: true, lastSeenAt: at }], threads: [{ runnerId: RUNNER, threadId: id, title: 't', cwd: '/x', accountId: 'a', provider: 'claude', status: 'idle', needsYou: false, unread: true, preview: '', createdAt: at, lastActivityAt: at }] });
   const relay = new Relay({
-    source: () => ({ key: OWNER, post: post as never, apiVersion: 999 }),
+    source: () => ({ key: OWNER, post: post as never, apiVersion: 999, download }),
     remote,
     subscribed: () => false,
     publish: () => {},
@@ -116,7 +145,7 @@ export async function threeWays(play: (p: Play) => void | Promise<void>) {
   const here = (): View => {
     const t = h.runner.get(id);
     const events = h.runner.events(id, {}).events as Record<string, any>[];
-    return { needs: t.needs, asks: (t.asks ?? []) as Ask[], next: lastNext(events), looseEnds: (t.looseEnds?.ends ?? []).map((e) => e.text), review: events.filter((e) => e.type === 'turn.completed').at(-1)?.review, plans: plansOf(events), messages: messagesOf(events), notes: loginNotes(events), failed: lastFailed(events) };
+    return { needs: t.needs, asks: (t.asks ?? []) as Ask[], next: lastNext(events), looseEnds: (t.looseEnds?.ends ?? []).map((e) => e.text), review: events.filter((e) => e.type === 'turn.completed').at(-1)?.review, plans: plansOf(events), messages: messagesOf(events), notes: loginNotes(events), failed: lastFailed(events), waitState: t.waitState };
   };
   let relayEvents: Record<string, any>[] = [];
   const viaRelay = async (): Promise<View> => {
@@ -130,16 +159,18 @@ export async function threeWays(play: (p: Play) => void | Promise<void>) {
     // sidebar's list, for the done card's own seq.
     const listed = relay.overlay(remote()).threads.find((t) => t.threadId === id) as { looseEnds?: { seq: number; ends: { text: string }[] } } | undefined;
     const ends = listed?.looseEnds && end && listed.looseEnds.seq === end.seq ? listed.looseEnds.ends.map((e) => e.text) : [];
-    return { needs: end?.needs, asks: (end?.asks ?? []) as Ask[], next: (end?.next ?? []) as string[], looseEnds: ends, review: end?.review, plans: plansOf(events), messages: messagesOf(events), notes: loginNotes(events), failed: lastFailed(events) };
+    // The state as another Mac's sidebar has it: the thread's index row.
+    const indexed = ((await b.ctx.db.query('threadIndex').collect()) as unknown as { threadId: string; waitState?: string }[]).find((r) => r.threadId === id);
+    return { needs: end?.needs, asks: (end?.asks ?? []) as Ask[], next: (end?.next ?? []) as string[], looseEnds: ends, review: end?.review, plans: plansOf(events), messages: messagesOf(events), notes: loginNotes(events), failed: lastFailed(events), waitState: indexed?.waitState };
   };
   const viaPhone = async (): Promise<View> => {
     const r = (await call(b.ctx, mods.phone.thread!, { token: TOKEN, threadId: id })) as { thread: Record<string, any>; messages: { role: 'user' | 'assistant'; text: string; origin?: string }[] };
-    const page = await call(b.ctx, mods.phone.messages!, { token: TOKEN, threadId: id, notes: true }) as { messages: { role: string; text: string }[] };
-    return { needs: r.thread.needs, asks: (r.thread.asks ?? []) as Ask[], next: (r.thread.next ?? []) as string[], looseEnds: ((r.thread.looseEnds ?? []) as { text: string }[]).map((e) => e.text), review: r.thread.review, plans: [], messages: r.messages.map((m) => ({ role: m.role, text: m.text, pictures: 0, ...(m.origin ? { origin: m.origin } : {}) })), notes: page.messages.filter(m => m.role === 'note').map(m => m.text), failed: r.thread.status === 'error' };
+    const page = await call(b.ctx, mods.phone.messages!, { token: TOKEN, threadId: id, notes: true }) as { messages: { role: string; text: string; plan?: boolean; planDecision?: string }[] };
+    return { needs: r.thread.needs, asks: (r.thread.asks ?? []) as Ask[], next: (r.thread.next ?? []) as string[], looseEnds: ((r.thread.looseEnds ?? []) as { text: string }[]).map((e) => e.text), review: r.thread.review, plans: page.messages.filter((m) => m.plan).map((m) => `${m.text.split('\n')[0]} (${m.planDecision ?? 'waiting'})`), messages: r.messages.map((m) => ({ role: m.role, text: m.text, pictures: 0, ...(m.origin ? { origin: m.origin } : {}) })), notes: page.messages.filter(m => m.role === 'note').map(m => m.text), failed: r.thread.status === 'error', waitState: r.thread.waitState };
   };
   const views = { here: here(), relay: await viaRelay(), phone: await viaPhone() };
   await sync.stop();
-  return { views, refused, backend: b, threadId: id, relay, relayEvents };
+  return { views, refused, backend: b, threadId: id, runnerId: RUNNER, relay, relayEvents };
 }
 
 // Without a subscriber of its own a ConvexSync opens a real Convex client for its url, and
@@ -155,10 +186,16 @@ const NO_SUBSCRIBER = { subscribe: () => () => undefined, close: () => undefined
  * in-memory backend here, or a real one (scripts/parity-seed.ts). Returns
  * the threads' ids in order; the caller stops `sync`.
  */
-export async function playInto(post: Post, runner: { key: string; runnerId: string; name: string }, plays: ((p: Play) => void | Promise<void>)[]) {
+export async function playInto(post: Post, runner: { key: string; runnerId: string; name: string }, plays: ((p: Play) => void | Promise<void>)[], upload: Upload = async () => 'st') {
   const h = makeHarness();
-  const sync = new ConvexSync({ config: { enabled: true, url: 'https://x.convex.cloud', name: runner.name, runnerId: runner.runnerId }, key: runner.key, home: h.cfg.home, runner: h.runner, version: '0.1.0+test', release: 'rel1', startedAt: '2026-10-27T00:00:00.000Z', clock: h.clock, log: nullLogger, post, upload: async () => 'st', subscriber: NO_SUBSCRIBER } as never);
+  const sync = new ConvexSync({ config: { enabled: true, url: 'https://x.convex.cloud', name: runner.name, runnerId: runner.runnerId }, key: runner.key, home: h.cfg.home, runner: h.runner, version: '0.1.0+test', release: 'rel1', startedAt: '2026-10-27T00:00:00.000Z', clock: h.clock, log: nullLogger, post, upload, subscriber: NO_SUBSCRIBER } as never);
   const ids: string[] = [];
+  // Running before the threads play, as on a real runner: a message's
+  // pasted pictures go up only as it's sent, never from the log afterwards
+  // (share-images.ts pastedImagesInEvent), and only once the backend has
+  // said its version.
+  sync.start();
+  await sync.flushNow();
   for (const play of plays) {
     const { thread } = h.runner.create({ text: 'Start', accountId: 'claude-3' });
     ids.push(thread.id);
@@ -200,6 +237,16 @@ export async function playInto(post: Post, runner: { key: string; runnerId: stri
         h.runner.send(thread.id, text, [], { origin: 'phone' });
         h.adapter.last.init();
       },
+      quietlyArchived: (why) => {
+        fs.writeFileSync(path.join(h.cfg.home, 'runner.json'), JSON.stringify({ experiments: { quietInboxMine: true } }));
+        const st = h.runner.threads.get(thread.id)!;
+        const seq = h.runner.looseEndsCard(st);
+        if (seq === undefined) throw new Error('quietlyArchived: the thread has no done card');
+        h.runner.quietArchive(st, seq, [{ by: 'claude-opus-5-5', skip: true, why, strong: true }]);
+      },
+      shouldHaveShown: () => {
+        h.runner.update({ threadId: thread.id, archived: false, verdict: 'shouldHaveShown' });
+      },
       queuedReminder: (text, scheduleId) => {
         h.runner.send(thread.id, text, [], { origin: 'schedule', scheduleId, queue: true });
       },
@@ -207,9 +254,6 @@ export async function playInto(post: Post, runner: { key: string; runnerId: stri
         h.runner.threads.get(thread.id)!.rec.labReview = { ...ledger, delivered: ledger.rounds };
       },
       looseEnds: (checkIn) => {
-        const file = path.join(h.cfg.home, 'runner.json');
-        const json = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
-        fs.writeFileSync(file, JSON.stringify({ ...json, experiments: { ...json.experiments, looseEnds: true } }));
         const mine = thread.id;
         const others = h.runner.schedulesFor;
         h.runner.schedulesFor = (t) => (t === mine ? [{ id: `s-${mine}`, title: checkIn.title, text: '', whenText: '', paused: false, createdAt: '', updatedAt: '', runs: 0, threadId: t, nextRunAt: checkIn.at }] : (others?.(t) ?? []));
@@ -219,9 +263,8 @@ export async function playInto(post: Post, runner: { key: string; runnerId: stri
   // The loose ends check runs after the turn ends, off the turn's path.
   for (const id of ids) {
     const end = Date.now() + 2000;
-    while (h.runner.threads.get(id)?.rec.needs?.needs === 'nothing' && !h.runner.get(id).looseEnds && fs.readFileSync(path.join(h.cfg.home, 'runner.json'), 'utf8').includes('"looseEnds":true') && Date.now() < end) await new Promise((r) => setTimeout(r, 10));
+    while (h.runner.threads.get(id)?.rec.needs?.needs === 'nothing' && !h.runner.get(id).looseEnds && Date.now() < end) await new Promise((r) => setTimeout(r, 10));
   }
-  sync.start();
   await sync.flushNow();
   await sync.flushNow();
   // The sidebar's index (thread-index.ts), which another runner lists the

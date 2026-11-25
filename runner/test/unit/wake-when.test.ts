@@ -194,7 +194,19 @@ test('end_turn snooze: words are read as Hibernate in words reads them', async (
   assert.match(asked[0].prompt, /when the parts arrive/);
   const t = h.runner.get(thread.id);
   assert.equal(t.snoozedUntil, NO_WAKE_TIME);
-  assert.deepEqual(t.wakeWhen, { said: 'when the parts arrive', topic: 'the parts arriving' });
+  assert.deepEqual(t.wakeWhen, { said: 'when the parts arrive', topic: 'the parts arriving', agent: true });
+});
+
+// 20 Nov 2026: "MACG-3843" in an agent's snooze words went to Date.parse,
+// which read it as the year 3843, and the thread showed "snoozed until
+// 3843-01-01" rather than waiting for the ticket.
+test('end_turn snooze: words naming a ticket number are words, not a year', async () => {
+  const { h, thread, asked } = setup(() => ok({ until: null, topic: 'MACG-3843 merged', why: 'an event' }));
+  turnWithSnooze(h, thread.id, { needs: 'nothing', snooze: 'MACG-3843' });
+  await tick();
+  await tick();
+  assert.equal(asked.length, 1);
+  assert.equal(h.runner.get(thread.id).snoozedUntil, NO_WAKE_TIME);
 });
 
 // 13 Nov 2026: an agent hibernated "until the GPUI app replaces the Swift
@@ -208,8 +220,9 @@ test('end_turn snooze in words: an agent waiting for something wakes with a turn
   assert.match(asked[0].prompt, /The thread's agent is waiting: until the GPUI app replaces the Swift app/);
   assert.match(asked[0].system!, /thread's own agent asking/);
   const t = h.runner.get(thread.id);
-  // Who set it stays in the runner: the protocol's wakeWhen is unchanged.
-  assert.deepEqual(t.wakeWhen, { said: 'until the GPUI app replaces the Swift app', topic: 'the GPUI app has replaced the Swift app' });
+  // `agent`: its own agent set it, so with commits not on main the sidebar
+  // shows it as waiting to land, not hibernating (Mike's own has no flag).
+  assert.deepEqual(t.wakeWhen, { said: 'until the GPUI app replaces the Swift app', topic: 'the GPUI app has replaced the Swift app', agent: true });
   assert.deepEqual(checkSummary(t), []);
   assert.match(h.events(thread.id).at(-1).text, /^Hibernating until the GPUI app has replaced the Swift app\. The agent said "until the GPUI app replaces the Swift app"\.$/);
   assert.deepEqual(h.runner.waitingTopics(), [{ threadId: thread.id, title: 'Plan the workbench drawers', topic: 'the GPUI app has replaced the Swift app', happened: true }]);

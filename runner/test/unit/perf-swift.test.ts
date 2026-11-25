@@ -5,13 +5,17 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
+import { PATIENCE_MS } from '../helpers/patience.ts';
 import { test, type TestContext } from 'node:test';
 
 const root = path.resolve(import.meta.dirname, '../../..');
 const pause = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// By the clock, with the suite's patience, not 500 polls (about 20 s): at a
+// load of 100 the worker wasn't ready in time (a fork, 15 Nov).
 async function until(check: () => boolean, message: string) {
-  for (let i = 0; i < 500; i++) { if (check()) return; await pause(40); }
-  assert.fail(message);
+  const end = Date.now() + PATIENCE_MS;
+  while (Date.now() < end) { if (check()) return; await pause(40); }
+  if (!check()) assert.fail(message);
 }
 function alive(pid: number) {
   const ps = spawnSync('ps', ['-p', String(pid), '-o', 'stat='], { encoding: 'utf8' });
@@ -20,7 +24,7 @@ function alive(pid: number) {
 function fixture(t: TestContext, { perf = true, tmpFallback = false } = {}) {
   const home = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "tb-swift's $& test-"));
   const repo = path.join(home, 'repo');
-  for (const dir of ['features/support', 'scripts/perf-swift-bin', 'app/Tools/mock-runner', 'bin']) fs.mkdirSync(path.join(repo, dir), { recursive: true });
+  for (const dir of ['features/support', 'scripts/perf-swift-bin', 'app/Tools', 'mock-runner', 'bin']) fs.mkdirSync(path.join(repo, dir), { recursive: true });
   // Stand-in for LaunchServices. Never call the host's real open command.
   fs.writeFileSync(path.join(repo, 'bin/open'), `#!/usr/bin/perl
 use POSIX;
@@ -57,17 +61,18 @@ exec "$app/Contents/MacOS/Threadbear", @ARGV;
   fs.writeFileSync(entry, `import fs from 'node:fs'; import { SwiftDriver } from ${JSON.stringify(path.join(repo, 'features/support/swift.ts'))}; fs.writeFileSync(process.env.HOME+'/worker.pid', String(process.pid)); const d = new SwiftDriver(); await d.start(); if (process.env.RELAUNCH) await d.relaunch(); if (process.env.POLL) { while(!fs.existsSync(process.env.HOME+'/mock.pid')) await new Promise(r=>setTimeout(r,20)); const count=()=>fs.readdirSync(process.env.THREADBEAR_PERF_CHILDREN).filter(n=>/^\\d+$/.test(n)).length; const before=count(); for(let i=0;i<20;i++) await d.dump(); fs.writeFileSync(process.env.HOME+'/counts',JSON.stringify([before,count()])); } fs.writeFileSync(process.env.HOME+'/ready', ''); if (process.env.NORMAL_STOP) { await d.stop(); } else { setInterval(()=>{}, 1000); }`);
   fs.writeFileSync(path.join(repo, 'bin/ps'), `#!/bin/bash
 if [[ " $* " = *' lstart= '* ]] && [ -e "$HOME/slow-ps" ]; then
-  while [ ! -e "$HOME/allow-reap" ]; do sleep .02; done
+  # Ends with the test process, so a killed run can't leave cleanup stuck here.
+  while [ ! -e "$HOME/allow-reap" ] && kill -0 ${process.pid} 2>/dev/null; do sleep .02; done
 fi
 exec /bin/ps "$@"
 `, { mode: 0o755 });
-  fs.writeFileSync(path.join(repo, 'app/Tools/mock-runner/server.mjs'), `import fs from 'node:fs'; fs.writeFileSync(process.env.HOME+'/mock.pid', String(process.pid)); fs.appendFileSync(process.env.HOME+'/all-mock.pids', process.pid+'\\n'); process.on('SIGTERM', ()=>{}); setInterval(()=>{},1000);`);
+  fs.writeFileSync(path.join(repo, 'mock-runner/server.mjs'), `import fs from 'node:fs'; fs.writeFileSync(process.env.HOME+'/mock.pid', String(process.pid)); fs.appendFileSync(process.env.HOME+'/all-mock.pids', process.pid+'\\n'); process.on('SIGTERM', ()=>{}); setInterval(()=>{},1000);`);
   fs.writeFileSync(path.join(repo, 'app/Tools/dev-app.sh'), `#!/bin/bash
 set -eu
 echo $$ >>"$HOME/all-launcher.pids"
 id=''
 for ((i=1;i<=$#;i++)); do if [ "\u0024{!i}" = --id ]; then j=$((i+1)); id="\u0024{!j}"; fi; done
-tmp_root="\u0024{TMPDIR:-/tmp}"
+tmp_root="\u0024{TMPDIR:-$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo "/tmp/threadbear-$(id -u)")}"
 mkdir -p "$tmp_root/threadbear-dev-app"
 state_root="$(cd "$tmp_root/threadbear-dev-app" && pwd -P)"
 dir="$state_root/$id"
@@ -89,7 +94,7 @@ APP
 chmod +x "$dir/Threadbear.app/Contents/MacOS/Threadbear"
 touch "$HOME/before-mock"
 while [ "\u0024{GAP:-}" = mock ] && [ ! -e "$HOME/proceed" ]; do sleep .02; done
-/usr/bin/perl -MPOSIX -e 'my $pid=fork(); die $! unless defined $pid; exit 0 if $pid; POSIX::setsid(); exec @ARGV or die $!;' "$THREADBEAR_NODE" "$(dirname "$0")/mock-runner/server.mjs" --data-dir "$dir/data" </dev/null >"$dir/mock.log" 2>&1
+/usr/bin/perl -MPOSIX -e 'my $pid=fork(); die $! unless defined $pid; exit 0 if $pid; POSIX::setsid(); exec @ARGV or die $!;' "$THREADBEAR_NODE" "$(dirname "$0")/../../mock-runner/server.mjs" --data-dir "$dir/data" </dev/null >"$dir/mock.log" 2>&1
 touch "$HOME/before-app"
 while [ "\u0024{GAP:-}" = app ] && [ ! -e "$HOME/proceed" ]; do sleep .02; done
 open -g -n --env 'BROWSERBEAR_HOME=private browser home' -a "$dir/Threadbear.app" --stdout "$dir/app.stdout" --stderr "$dir/app.stderr" --args --data-dir "$dir/data" --automation-id "$id" --test-owner "$HOME" 'argument with spaces'
@@ -100,7 +105,10 @@ for i in {1..500}; do [ ! -e "$HOME/app.pid" ] || exit 0; sleep .02; done
 exit 1
 `, { mode: 0o755 });
   const children: (ChildProcess & { done: Promise<number | null>; output: string })[] = [];
-  const env = { ...process.env, HOME: home, TMPDIR: home, PATH: `${repo}/bin:${process.env.PATH}`, THREADBEAR_NODE: process.execPath, THREADBEAR_PERF_LOCK_OWNER: '', THREADBEAR_PERF_CHILDREN: '' };
+  // A 1 s TERM grace (scripts/perf-children.pl, hangup-guard.sh), not 5 s:
+  // the stand-in app and mock ignore TERM, so every test waited it out
+  // (perf-lock.test.ts's host() says more).
+  const env = { ...process.env, HOME: home, TMPDIR: home, PATH: `${repo}/bin:${process.env.PATH}`, THREADBEAR_NODE: process.execPath, THREADBEAR_PERF_LOCK_OWNER: '', THREADBEAR_PERF_CHILDREN: '', THREADBEAR_STOP_GRACE_SECS: '1' };
   function run(extra: NodeJS.ProcessEnv = {}, args = [process.execPath, entry]) {
     const child = spawn(perf ? 'perl' : args[0], perf ? [path.join(root, 'scripts/perf-lock.pl'), '-', ...args] : args.slice(1), { env: { ...env, ...extra }, stdio: ['pipe', 'pipe', 'pipe'] });
     const result = child as typeof children[number];
@@ -127,7 +135,8 @@ exit 1
       for (const name of ['app', 'mock', 'launcher']) {
         try { for (const pid of fs.readFileSync(path.join(home, `all-${name}.pids`), 'utf8').trim().split('\n')) killOwned(Number(pid)); } catch {}
       }
-      // A TMPDIR-fallback fixture uses /tmp, just as the frozen launcher does.
+      // A TMPDIR-fallback fixture uses this account's own temp folder, as the
+      // frozen launcher does.
       if (tmpFallback && fs.existsSync(path.join(home, 'instance-dir'))) {
         const instance = fs.readFileSync(path.join(home, 'instance-dir'), 'utf8');
         const worker = fs.readFileSync(path.join(home, 'worker.pid'), 'utf8');
@@ -235,6 +244,12 @@ test('Swift TMPDIR fallback matches the launcher even when TMP points elsewhere'
   const first = h.run({ NORMAL_STOP: '1', TMPDIR: '', TMP: h.home, TEMP: h.home });
   assert.equal(await first.done, 0, first.output);
   assert.ok(!fs.existsSync(h.file('ordinary-open')), 'TMP fallback bypassed the app gate');
+  // This account's own temp folder, never the shared /tmp: a second account
+  // on Tinker Desk couldn't make its instance in the first's (19 Nov).
+  // (Linux has no such folder, so there it's /tmp/threadbear-<uid>.)
+  const mac = spawnSync('getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf8' });
+  const own = fs.realpathSync(mac.status === 0 ? mac.stdout.trim() : `/tmp/threadbear-${process.getuid!()}`);
+  assert.ok(fs.readFileSync(h.file('instance-dir'), 'utf8').startsWith(own + path.sep), 'the fallback left this account\'s temp folder');
   const next = h.run({}, h.verify);
   assert.equal(await next.done, 0, next.output);
 });

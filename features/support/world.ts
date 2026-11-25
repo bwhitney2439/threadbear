@@ -34,6 +34,8 @@ export class ThreadbearWorld extends World {
   shareResult?: string;
   /** The thread whose page flew to its heading (archive-flight.steps.ts). */
   flownFrom?: string;
+  /** The panels' layout (`dock`) just before the last ⌘J, for panel-motion.steps.ts. */
+  dockBefore?: string;
   /** A stand-in BrowserBear, for @browserbear scenarios (support/browserbear.ts). */
   bear?: StandInBrowserBear;
 
@@ -43,7 +45,7 @@ export class ThreadbearWorld extends World {
   }
 
   /** Waits until a dump passes `check` (it's slow to land, as everything is). */
-  async until<T>(what: string, check: (d: Dump) => T | undefined | false | null, ms = 15_000): Promise<T> {
+  async until<T>(what: string, check: (d: Dump) => T | undefined | false | null | '' | 0, ms = 15_000): Promise<T> {
     const deadline = Date.now() + ms;
     let last: Dump | undefined;
     for (;;) {
@@ -81,6 +83,18 @@ export function describe(d: Dump): string {
 }
 
 setWorldConstructor(ThreadbearWorld);
+
+// The stress run's slow runner (tools/stress.mjs): every scenario's mock
+// answers late by these, unless the scenario sets its own below. Defined
+// first, so a tagged scenario's own delay wins, and set again each scenario
+// since those After hooks delete theirs.
+Before(() => {
+  for (const [from, to] of [
+    ['TB_STRESS_EVENTS_DELAY_MS', 'THREADBEAR_MOCK_EVENTS_DELAY_MS'],
+    ['TB_STRESS_LIST_DELAY_MS', 'THREADBEAR_MOCK_LIST_DELAY_MS'],
+    ['TB_STRESS_JITTER_MS', 'THREADBEAR_MOCK_JITTER_MS'],
+  ]) if (process.env[from]) process.env[to] = process.env[from];
+});
 
 // A pin request must survive other pane updates while its highlights arrive.
 Before({ tags: '@panel.requests and @highlights.pinned' }, () => {
@@ -121,6 +135,19 @@ After({ tags: '@picture-loading' }, () => {
   else process.env.MOCK_SCRIPTED_TURNS = startingScriptedTurns;
 });
 
+// On CI, a line per scenario as it ends: the progress dots never end their
+// line, so GitHub's log showed nothing at all for a run that hit its time
+// limit (17 Nov), not even which scenario it was on.
+let scenarioStarted = 0;
+Before(() => {
+  scenarioStarted = Date.now();
+});
+After(({ result, pickle, willBeRetried }) => {
+  if (!process.env.CI) return;
+  const secs = ((Date.now() - scenarioStarted) / 1000).toFixed(1).padStart(5);
+  console.log(`\n${secs}s ${result?.status ?? '?'}${willBeRetried ? ' (will retry)' : ''} ${path.basename(pickle.uri)}: ${pickle.name}`);
+});
+
 Before(async function (this: ThreadbearWorld, { pickle }) {
   // A scenario about paging needs a thread longer than one page of events.
   const long = pickle.tags.some((t) => t.name === '@long-thread');
@@ -130,13 +157,10 @@ Before(async function (this: ThreadbearWorld, { pickle }) {
   // both drivers leave out otherwise (TB_MOCK_NO_REMOTE in gpui.ts, swift.ts).
   if (pickle.tags.some((t) => t.name === '@remote-threads')) process.env.TB_MOCK_REMOTE = '1';
   else delete process.env.TB_MOCK_REMOTE;
-  // Decisions on the Projects page: the mock's cards of asks in Threadbear,
-  // and the projectDecisions experiment on in its hello.
-  if (pickle.tags.some((t) => t.name === '@project-decisions')) process.env.TB_MOCK_DECISIONS = '1';
-  else delete process.env.TB_MOCK_DECISIONS;
-  // Open Anything's experiment off: the mock's hello leaves it out.
-  if (pickle.tags.some((t) => t.name === '@open-anything-off')) process.env.TB_MOCK_OPEN_ANYTHING_OFF = '1';
-  else delete process.env.TB_MOCK_OPEN_ANYTHING_OFF;
+  // Virtual runners: the mock's "Cloud (Fly)" and a thread on a box of it in
+  // each state (MOCK_VIRTUAL_RUNNERS in its server.mjs).
+  if (pickle.tags.some((t) => t.name === '@virtual-runners')) process.env.MOCK_VIRTUAL_RUNNERS = '1';
+  else delete process.env.MOCK_VIRTUAL_RUNNERS;
   // Nested threads: the mock's coordinator and the threads it started, with
   // the nestedThreads experiment on, or off with @nested-threads-off.
   const nestedOff = pickle.tags.some((t) => t.name === '@nested-threads-off');
@@ -144,6 +168,29 @@ Before(async function (this: ThreadbearWorld, { pickle }) {
   else delete process.env.TB_MOCK_NESTED;
   if (nestedOff) process.env.TB_MOCK_NESTED_OFF = '1';
   else delete process.env.TB_MOCK_NESTED_OFF;
+  // The done card's Archive menu: the inboxGuess experiment on in the hello.
+  if (pickle.tags.some((t) => t.name === '@inbox-guess')) process.env.TB_MOCK_INBOX_GUESS = '1';
+  else delete process.env.TB_MOCK_INBOX_GUESS;
+  // Its files read 3 s after the rest of it, as a big PR's are.
+  if (pickle.tags.some((t) => t.name === '@slow-pr-files')) process.env.TB_MOCK_PR_FILES_MS = '3000';
+  else delete process.env.TB_MOCK_PR_FILES_MS;
+  // The Recipes view: the recipes experiment on, with the mock's recipes.
+  if (pickle.tags.some((t) => t.name === '@recipes')) process.env.TB_MOCK_RECIPES = '1';
+  else delete process.env.TB_MOCK_RECIPES;
+  if (pickle.tags.some((t) => t.name === '@review.canvas')) process.env.TB_MOCK_REVIEW_CANVAS = '1';
+  else delete process.env.TB_MOCK_REVIEW_CANVAS;
+  // The Canvas page, with the nested demo's coordinator and the threads it started.
+  if (pickle.tags.some((t) => t.name === '@thread.canvas')) {
+    process.env.TB_MOCK_THREAD_CANVAS = '1';
+    process.env.TB_MOCK_NESTED = '1';
+    process.env.TB_MOCK_NESTED_OFF = '1';
+  } else delete process.env.TB_MOCK_THREAD_CANVAS;
+  // Agent Archive in the sidebar's search: the archive experiment on, with
+  // the mock's made-up sessions, and its answers slow with @slow-archive.
+  if (pickle.tags.some((t) => t.name === '@archive')) process.env.TB_MOCK_ARCHIVE = '1';
+  else delete process.env.TB_MOCK_ARCHIVE;
+  if (pickle.tags.some((t) => t.name === '@slow-archive')) process.env.TB_MOCK_ARCHIVE_MS = '2500';
+  else delete process.env.TB_MOCK_ARCHIVE_MS;
   // Parts of a project: Photo sync as a part of Threadbear.
   if (pickle.tags.some((t) => t.name === '@project-parts')) process.env.TB_MOCK_PARTS = '1';
   else delete process.env.TB_MOCK_PARTS;
@@ -156,15 +203,34 @@ Before(async function (this: ThreadbearWorld, { pickle }) {
   // The web runtime's folder for this scenario (support/web-runtime.ts).
   if ((await webRuntimeSetup(pickle.tags.map((t) => t.name))) === 'skipped') return 'skipped';
   await this.app.start();
+  // The stress run's window size and look (tools/stress.mjs), before any step.
+  const size = /^(\d+)x(\d+)$/.exec(process.env.TB_STRESS_SIZE ?? '');
+  if (size) await this.app.do({ cmd: 'size', w: Number(size[1]), h: Number(size[2]) });
+  if (process.env.TB_STRESS_APPEARANCE) await this.app.do({ cmd: 'appearance', mode: process.env.TB_STRESS_APPEARANCE });
 });
 
 After(async function (this: ThreadbearWorld, { result, pickle }) {
+  // The stress run's record (tools/stress.mjs): a line per scenario as it
+  // ends, so a round cut short at its time limit still has what it ran.
+  if (process.env.TB_STRESS_LOG) {
+    const message = (result?.message ?? '').split('\n').slice(0, 6).join('\n');
+    fs.appendFileSync(process.env.TB_STRESS_LOG, JSON.stringify({
+      uri: path.basename(pickle.uri), name: pickle.name, tags: pickle.tags.map((t) => t.name),
+      status: result?.status, secs: Number(((Date.now() - scenarioStarted) / 1000).toFixed(1)), message,
+    }) + '\n');
+  }
   if (result?.status === Status.FAILED) {
     const dir = path.resolve('reports/failures');
     fs.mkdirSync(dir, { recursive: true });
     const name = pickle.name.replace(/[^a-z0-9]+/gi, '-').toLowerCase();
     const file = path.join(dir, `${this.app.name}-${name}.png`);
     await this.app.shot(file).catch(() => {});
+    // The stress run also keeps what the app said it showed (tools/stress.mjs).
+    if (process.env.TB_STRESS_LOG) {
+      const dump = await this.app.dump().catch((e: Error) => ({ error: e.message }));
+      fs.writeFileSync(file.replace(/\.png$/, '.dump.json'), JSON.stringify(dump, null, 1));
+      fs.writeFileSync(file.replace(/\.png$/, '.log'), await this.app.appLog().catch(() => ''));
+    }
     if (fs.existsSync(file)) this.attach(fs.readFileSync(file), 'image/png');
   }
   await this.app.stop();

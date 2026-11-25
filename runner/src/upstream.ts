@@ -30,20 +30,33 @@
 // hand on: the runner it's running is main's, has been marked good and up
 // for an hour, and main's tip is an hour old, so a commit that crashes
 // the runner or is about to be followed by its fix isn't what goes out.
-// And GitHub's checks have passed on that exact commit (ciVerdict): the
-// runner staying up says nothing about the apps building. release/2026-11-04
+// And GitHub's checks have passed on that exact commit (ciVerdict), and
+// each workflow that didn't run on it (its paths didn't change) passed on
+// the last commit it did run on (earlierVerdict): the runner staying up
+// says nothing about the apps building. release/2026-11-04
 // to -06 went out not building on Xcode 26.6, and people installing it
 // found out before Mike did (PR #1, Maroš's fork).
-import { spawn } from 'node:child_process';
+// When the tip is red, the newest older commit that passes the same checks
+// goes out instead (newestGreen).
+import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { Clock, TimerHandle } from './clock.ts';
 import type { Logger } from './log.ts';
-import { applyKeyChanges, KeysBusy, keysIn, revokedPath, REVOKED_FILE, signerKey, SIGNERS_FILE } from './release-keys.ts';
+import { IS_WINDOWS } from './platform.ts';
+import { killGroup } from './proc.ts';
+import { ADD_DELAY_MS, applyKeyChanges, KeysBusy, keysIn, revokedPath, REVOKED_FILE, signerKey, SIGNERS_FILE } from './release-keys.ts';
+import { changelogFor, type ReleaseChangelog } from './changelog.ts';
+import { LISTING_GIT_CONFIG, parseConfigListBytes, repoProofConfig, settable, TRUSTED_SCOPES, untrustedGitEnv } from './safe-git.ts';
 
 export const FETCH_INTERVAL_MS = 6 * 60 * 60_000;
+// After a look that failed (no network yet after waking, GitHub down) the
+// next one is this soon. Waiting the full six hours, a Mac that sleeps a lot
+// missed releases for days (a fork's runner, 8 to 15 Nov), and the Updates
+// panel took their commits for the copy's own.
+export const RETRY_AFTER_FAILURE_MS = 15 * 60_000;
 export const PUBLISH_INTERVAL_MS = 60 * 60_000;
 // The first look, a while after the runner starts: never in the way of a
 // start that's about to be rolled back.
@@ -63,11 +76,12 @@ const STAGED_NS = 'refs/incoming/';
 const STAGED_MAIN = 'refs/incoming-main/main';
 // The releases that verified, copied from INCOMING_NS and never moved once
 // there. Their own namespaces, so the fork's own tags are never touched.
-const REF_NS = 'refs/threadbear/upstream/';
+export const UPSTREAM_REFS = 'refs/threadbear/upstream/';
+const REF_NS = UPSTREAM_REFS;
 const MAX_SUBJECTS = 50;
 // What a release's name is after release/: the local date it was tagged
 // (tagFor). Nothing else is ever looked at.
-const RELEASE_NAME = /^\d{4}-\d{2}-\d{2}$/;
+export const RELEASE_NAME = /^\d{4}-\d{2}-\d{2}$/;
 // How far past today's date (UTC) a release's date can be: Mike's day can
 // start well before the fork's.
 const FUTURE_SLACK_MS = 2 * 24 * 60 * 60_000;
@@ -102,7 +116,11 @@ export type UpstreamRelease = {
   // Plain-words notes for people, from each release main doesn't have yet,
   // newest first. Each verified tag's commit subjects fill in when its
   // message has no plain-words notes.
-  notes?: { tag: string; lines: string[] }[];
+  notes?: { tag: string; date?: string; lines: string[] }[];
+  // The What's new page's cards for those releases, when upstream is a
+  // repo with one and it could be read (changelog.ts). Not signed: only
+  // something to look at, with the notes as the fallback.
+  changelog?: ReleaseChangelog;
 };
 
 // runner.status's `upstream`, and RunnerUpdates' (docs/protocol.md).
@@ -123,7 +141,8 @@ export type UpstreamStatus = {
 };
 
 // One GitHub Actions run of a workflow on a commit, as ciVerdict needs it.
-export type CiRun = { workflow: string; name: string; status: string; conclusion: string | null; attempt: number };
+// file: its workflow file (.github/workflows/x.yml); sha: the commit it ran on.
+export type CiRun = { workflow: string; name: string; status: string; conclusion: string | null; attempt: number; file?: string; sha?: string };
 
 // signingKey: a key file, as `git tag -s` takes it (user.signingkey): a
 // plain private key (a fork of a fork, or Mike's before Touch ID), or a
@@ -181,6 +200,17 @@ export type UpstreamDeps = {
   stageMaxBytes?: number;
   // The Actions runs on a commit, from GitHub (githubRuns). Replaced in tests.
   ciRuns?: (repo: string, commit: string) => Promise<CiRun[]>;
+  // One workflow's latest push runs on main, newest first, from GitHub
+  // (githubWorkflowRuns). Replaced in tests.
+  ciHistory?: (repo: string, file: string) => Promise<CiRun[]>;
+  // The What's new page's cards for some release tags (changelogFor).
+  // Replaced in tests.
+  changelog?: (upstreamKey: string, tags: string[]) => Promise<ReleaseChangelog | undefined>;
+  // Tests: upstream and origin are folders on this Mac, reached with git's
+  // file protocol, which a real runner never fetches a release over
+  // (fetchableUrl), and the upload-pack git runs for them (a hanging one).
+  localRemotes?: boolean;
+  uploadPack?: string;
 };
 
 // The push runs on one commit of a public GitHub repo ("owner/name"). No
@@ -192,8 +222,35 @@ export async function githubRuns(repo: string, commit: string): Promise<CiRun[]>
     signal: AbortSignal.timeout(30_000),
   });
   if (!res.ok) throw new Error(`GitHub answered ${res.status}`);
-  const body = (await res.json()) as { workflow_runs?: { workflow_id: number; name: string; status: string; conclusion: string | null; run_attempt?: number }[] };
-  return (body.workflow_runs ?? []).map((r) => ({ workflow: String(r.workflow_id), name: r.name, status: r.status, conclusion: r.conclusion, attempt: r.run_attempt ?? 1 }));
+  return ciRunsFrom(await res.json());
+}
+
+// A workflow's latest push runs on main (`file`, .github/workflows/x.yml),
+// newest first: earlierVerdict looks back through them. One page is a day
+// or two of a busy main, and a workflow quiet for longer than that has
+// nothing on main since to have broken.
+export async function githubWorkflowRuns(repo: string, file: string): Promise<CiRun[]> {
+  const res = await fetch(`https://api.github.com/repos/${repo}/actions/workflows/${encodeURIComponent(path.basename(file))}/runs?branch=main&event=push&per_page=${HISTORY_PAGE}`, {
+    headers: { accept: 'application/vnd.github+json', 'user-agent': 'threadbear-runner' },
+    signal: AbortSignal.timeout(30_000),
+  });
+  // A workflow GitHub doesn't know (only just added, never run) has no verdict.
+  if (res.status === 404) return [];
+  if (!res.ok) throw new Error(`GitHub answered ${res.status}`);
+  return ciRunsFrom(await res.json());
+}
+
+function ciRunsFrom(json: unknown): CiRun[] {
+  const body = json as { workflow_runs?: { workflow_id: number; name: string; status: string; conclusion: string | null; run_attempt?: number; path?: string; head_sha?: string }[] };
+  return (body.workflow_runs ?? []).map((r) => ({
+    workflow: String(r.workflow_id),
+    name: r.name,
+    status: r.status,
+    conclusion: r.conclusion,
+    attempt: r.run_attempt ?? 1,
+    ...(r.path ? { file: r.path } : {}),
+    ...(r.head_sha ? { sha: r.head_sha } : {}),
+  }));
 }
 
 // Whether a commit's checks let it be a release: undefined when they do,
@@ -212,6 +269,39 @@ export function ciVerdict(runs: CiRun[]): string | undefined {
   if (failed.length) return `${failed.map((r) => `"${r.name}"`).join(', ')} didn't pass on it`;
   if (runsOf.some((r) => r.status !== 'completed')) return "GitHub's checks are still running on it";
   return undefined;
+}
+
+// A run that says nothing about the commit it ran on (skipped). Not a
+// cancelled one: a push that cancels the run before it has a run of its
+// own, newer and on a commit the tip has, so one reached here was cancelled
+// by hand, or by a push this Mac's main hasn't got, and its changes were
+// never checked (Codex's reviews, 16 Nov).
+const NO_VERDICT = new Set(['skipped', 'neutral', 'stale']);
+
+// How many of a workflow's runs on main earlierVerdict is given.
+export const HISTORY_PAGE = 100;
+// How far back along main newestGreen looks for a green commit.
+export const GREEN_LOOKBACK = 80;
+
+// A workflow that didn't run on the tip, as its paths didn't change: what
+// its last finished run on a commit the tip has says, from `history`
+// (newest first, as githubWorkflowRuns gives them). Without this, a red run
+// is passed over by the next push that doesn't touch its paths, and that
+// tip goes out with the break: release/2026-11-15 was tagged on a commit
+// only Android and the desktop app had run on. Undefined when it passed,
+// or it has never run on main. A full page with none of its runs on a
+// commit the tip has can't say, so that holds too (Codex's review, 16 Nov).
+export function earlierVerdict(history: CiRun[], has: ReadonlySet<string>): string | undefined {
+  for (const r of history) {
+    if (!r.sha || !has.has(r.sha)) continue;
+    const on = r.sha.slice(0, 8);
+    if (r.status !== 'completed') return `"${r.name}" is still running on ${on}`;
+    if (r.conclusion === 'cancelled') return `"${r.name}" was cancelled on ${on}, the last commit it ran on`;
+    if (NO_VERDICT.has(r.conclusion ?? '')) continue;
+    return r.conclusion === 'success' ? undefined : `"${r.name}" didn't pass on ${on}, the last commit it ran on`;
+  }
+  const name = history[0]?.name;
+  return history.length >= HISTORY_PAGE ? `none of "${name}"'s last ${HISTORY_PAGE} runs on GitHub were on a commit main has here` : undefined;
 }
 
 export function signersPath(home: string): string {
@@ -254,8 +344,14 @@ function folderBytes(dir: string): number {
 }
 
 // input: what it reads on stdin. over: asked every half second while it
-// runs; true stops it (stageReleases' size limit).
-export type GitOptions = { timeoutMs?: number; env?: Record<string, string>; input?: string; over?: () => string | undefined };
+// runs; true stops it (stageReleases' size limit). The rest say what kind
+// of release git it is (releaseGit, below): network 'remote' for one that
+// talks to upstream or origin (https and ssh only), 'local' for one that
+// fetches from a folder on this Mac (the check's own staging repo); owner
+// for Mike's own publishing (his signing key, and his credential helpers and
+// ssh for the push); files lets 'remote' reach a folder too (tests only:
+// their remotes are folders).
+export type GitOptions = { timeoutMs?: number; env?: Record<string, string>; input?: string; over?: () => string | undefined; network?: 'remote' | 'local'; owner?: boolean; files?: boolean };
 
 export function gitAsync(cwd: string, args: string[], opts: GitOptions = {}): Promise<string> {
   return runGit(cwd, args, opts).then((out) => out.toString('utf8').trim());
@@ -275,12 +371,136 @@ export function bareRepoArgs(cwd: string): string[] {
   return !at('.git') && at('HEAD') && at('objects') && at('refs') ? ['--git-dir', path.resolve(cwd)] : [];
 }
 
-function runGit(cwd: string, args: string[], opts: GitOptions): Promise<Buffer> {
+// Release git: what every git here runs as (Daybreak 179 and 180, 24 Nov
+// 2026). The checkout's .git isn't something Threadbear made or can vouch
+// for: a checkout from an archive or a shared drive brings its own, and a
+// thread's worktree shares it, so its config, refs/replace/ and info/grafts
+// are anyone's who could write there. The release check runs by itself, two
+// minutes after the runner starts, so before any of this git ran the
+// checkout's own core.sshCommand, credential helpers, a remote's uploadpack
+// or remote helper, and its hooks, before a signature had been looked at;
+// and read a release's commit through its replacement objects, so a release
+// key file could come from a commit nobody signed. So:
+// - none of the runner's GIT_ variables (they can add config or point git
+//   elsewhere), and for anything but Mike's own publishing no system or
+//   global config either, so nothing of anyone's config names a program;
+// - the checkout's own config is read just before each command, and every
+//   setting in it that would run something is switched off on the command
+//   line, which beats it (safe-git.ts repoProofConfig, the same as a
+//   thread's move: hooks, fsmonitor, filters, diff drivers, credential
+//   helpers, ssh and askpass programs, protocols it allows), plus the
+//   signing programs, showing signatures, and push's own signing and
+//   submodules (RELEASE_CONFIG);
+// - only https and ssh to a remote, only a folder for the local fetch, and
+//   the remote's address passed as a URL (fetchableUrl), with git's own
+//   upload-pack and receive-pack named, and a checkout whose config
+//   rewrites an address or configures a remote named by one refused;
+// - replacement objects, grafts and the commit-graph off, so an object id
+//   is that object: a signed release's commit can't be read as another.
+//   A checkout that has replacement refs or grafts isn't checked at all
+//   (substitutes).
+// Mike's own publishing (owner) keeps his system and global config, for his
+// signing setup and his credential helper or ssh on the push to GitHub; the
+// checkout's own config is switched off for it all the same.
+const RELEASE_CONFIG: readonly string[] = [
+  '-c', 'core.commitGraph=false',
+  '-c', 'log.showSignature=false',
+  '-c', 'core.alternateRefsCommand=true',
+  '-c', 'core.pager=cat',
+  '-c', 'push.gpgSign=false',
+  '-c', 'push.recurseSubmodules=no',
+  '-c', 'advice.graftFileDeprecated=false',
+];
+// The programs a release's git could run that are named by one setting each:
+// the ssh command and the signing programs (only `git tag -s` on Mike's
+// runner signs). Each is set every time, to the owner's own or git's default,
+// whatever the checkout's config says, so it holds even if that config
+// changes between the look at it and the command (Codex's review, 24 Nov
+// 2026); credential helpers too (releaseGitConfig).
+const PROGRAMS: { key: string; fallback: string }[] = [
+  { key: 'core.sshcommand', fallback: 'ssh' },
+  { key: 'gpg.program', fallback: 'gpg' },
+  { key: 'gpg.openpgp.program', fallback: 'gpg' },
+  { key: 'gpg.x509.program', fallback: 'gpgsm' },
+  { key: 'gpg.ssh.program', fallback: 'ssh-keygen' },
+  { key: 'gpg.ssh.defaultkeycommand', fallback: '' },
+];
+// git's own, by name, whatever a remote's settings say (a remote named by its
+// URL is one too).
+export const UPLOAD_PACK = '--upload-pack=git-upload-pack';
+const RECEIVE_PACK = '--receive-pack=git-receive-pack';
+// What the runner's environment keeps for release git: who commits (Mike's
+// tag needs a tagger), and for owner, which of his config files git reads.
+const KEEP_ENV = /^GIT_(AUTHOR|COMMITTER)_(NAME|EMAIL|DATE)$/;
+const OWNER_ENV = /^GIT_(CONFIG_(GLOBAL|SYSTEM|NOSYSTEM)|SSH_COMMAND)$/;
+
+export function releaseGitEnv(opts: Pick<GitOptions, 'env' | 'owner'> = {}): NodeJS.ProcessEnv {
+  const kept = Object.fromEntries(Object.entries(process.env).filter(([k]) => KEEP_ENV.test(k) || (opts.owner && OWNER_ENV.test(k))));
+  return {
+    ...untrustedGitEnv(),
+    ...kept,
+    ...(opts.owner ? {} : { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' }),
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_ASKPASS: '',
+    ...opts.env,
+    // After the caller's, so nothing turns them back on.
+    GIT_NO_REPLACE_OBJECTS: '1',
+    GIT_GRAFT_FILE: '/dev/null',
+    GIT_NO_LAZY_FETCH: '1',
+  };
+}
+
+// The -c settings for release git in `cwd`, from its config as git reads it
+// with `env`. Throws when it can't be read, or has a setting -c can't reach.
+// What's switched off by name (a config hook's, a filter's) is what this
+// look found: one the checkout's config gains between the look and the
+// command isn't, as for a thread's move (safe-git.ts untrustedGit); the
+// programs above are set whatever it says.
+export async function releaseGitConfig(cwd: string, env: NodeJS.ProcessEnv, opts: Pick<GitOptions, 'network' | 'files'> = {}): Promise<string[]> {
+  const listed = await new Promise<Buffer>((resolve, reject) => {
+    execFile('git', [...LISTING_GIT_CONFIG, '-C', cwd, ...bareRepoArgs(cwd), 'config', '--list', '--show-scope', '-z'], { env, encoding: 'buffer', timeout: 10_000, killSignal: 'SIGKILL', maxBuffer: 4 * 1024 * 1024, windowsHide: true }, (err, stdout, stderr) =>
+      err ? reject(new Error(`couldn't read the checkout's git config: ${String(stderr).trim() || err.message}`)) : resolve(stdout),
+    );
+  });
+  const entries = parseConfigListBytes(listed);
+  // A remote's address is given to git as a URL (fetchableUrl), but the
+  // checkout's config can still rewrite it (url.<x>.insteadOf and
+  // pushInsteadOf), give it settings of its own under a remote named by
+  // that URL (a push URL, a remote helper, a proxy: git looks a URL up as a
+  // remote's name first; every address fetchableUrl gives has a colon), or
+  // send https through a proxy of its choosing with certificates unchecked
+  // (http.*, which -c can't reliably override, as a setting for a URL beats
+  // one for all). Each sends upstream's fetch, or Mike's push with his
+  // credentials, somewhere the configured address doesn't say, so a
+  // checkout that has one isn't used for network git at all (Gemini's
+  // reviews, 24 Nov 2026). The owner's own (global) settings are his.
+  // files: tests, whose remotes are folders reached through an insteadOf.
+  if (opts.network === 'remote' && !opts.files) {
+    const redirect = entries.find((e) => !TRUSTED_SCOPES.has(e.scope) && (/^(url|http)\./.test(e.key) || /^remote\.[\s\S]*:[\s\S]*\.[^.]+$/.test(e.key)));
+    if (redirect) throw new Error(`this checkout's own git config changes where or how git reaches a remote (${JSON.stringify(redirect.key.slice(0, 80))}), so release git won't reach one from it; remove that setting`);
+  }
+  const out = [...repoProofConfig(entries, opts.network === 'remote' ? 'remote' : opts.network === 'local' ? 'bundle' : undefined), ...RELEASE_CONFIG];
+  // repoProofConfig lets a remote be a folder too (a thread's move needs
+  // that); a release's never is.
+  if (opts.network === 'remote' && !opts.files) out.push('-c', 'protocol.file.allow=never');
+  const own = (match: (k: string) => boolean) => entries.filter((e) => match(e.key) && TRUSTED_SCOPES.has(e.scope));
+  for (const p of PROGRAMS) out.push('-c', `${p.key}=${own((k) => k === p.key).pop()?.value ?? p.fallback}`);
+  // An empty helper empties the list git has so far (any URL's too); then
+  // the owner's own, in order.
+  out.push('-c', 'credential.helper=');
+  for (const e of own((k) => /^credential\.([\s\S]*\.)?helper$/.test(k))) out.push('-c', `${settable(e.key)}=${e.value}`);
+  return out;
+}
+
+async function runGit(cwd: string, args: string[], opts: GitOptions): Promise<Buffer> {
+  const env = releaseGitEnv(opts);
+  const config = await releaseGitConfig(cwd, env, opts);
   return new Promise((resolve, reject) => {
-    const child = spawn('git', ['-C', cwd, ...bareRepoArgs(cwd), ...args], {
+    const child = spawn('git', [...config, '-C', cwd, ...bareRepoArgs(cwd), ...args], {
       stdio: [opts.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
-      detached: true,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...opts.env },
+      detached: !IS_WINDOWS,
+      windowsHide: true,
+      env,
     });
     const out: Buffer[] = [];
     let size = 0;
@@ -289,11 +509,9 @@ function runGit(cwd: string, args: string[], opts: GitOptions): Promise<Buffer> 
     const stop = (reason: string) => {
       if (why) return;
       why = reason;
-      try {
-        process.kill(-child.pid!, 'SIGKILL');
-      } catch {
-        child.kill('SIGKILL');
-      }
+      // The group, or on Windows the process tree (proc.ts killGroup), so a
+      // git helper that hangs goes with git; git alone if that can't be done.
+      if (!killGroup(child.pid!, 'SIGKILL')) child.kill('SIGKILL');
     };
     const timeoutMs = opts.timeoutMs ?? GIT_TIMEOUT_MS;
     const timer = setTimeout(() => stop(`timed out after ${Math.round(timeoutMs / 1000)} s`), timeoutMs);
@@ -325,10 +543,32 @@ function runGit(cwd: string, args: string[], opts: GitOptions): Promise<Buffer> 
       if (watch) clearInterval(watch);
       // The reason first: a check's status keeps only the start of it.
       if (why) reject(new Error(`git ${args.find((a) => !a.startsWith('-') && !a.includes('=')) ?? ''} ${why} (git ${args.join(' ')})`));
-      else if (code !== 0) reject(new Error(`git ${args.join(' ')} failed: ${err.trim() || `exit ${code ?? signal}`}`));
+      else if (code !== 0) reject(Object.assign(new Error(`git ${args.join(' ')} failed: ${err.trim() || `exit ${code ?? signal}`}`), { exitCode: code }));
       else resolve(Buffer.concat(out));
     });
   });
+}
+
+// Where a remote's releases are fetched from, rebuilt from its configured
+// address (remote.<name>.url, as written, not as an insteadOf rewrites it):
+// an https or ssh address of a plain host and path, or undefined. A local
+// path, file://, ext:: or a remote helper's `x::` never is, and a user name
+// and password in an https one are left out (Mike's repo is public). What's
+// fetched is trusted only once its signature checks, so the address only
+// says where to look; this keeps it from naming a program or another repo
+// on this Mac. files: a folder too (tests only).
+export function fetchableUrl(raw: string | undefined, opts: { files?: boolean } = {}): string | undefined {
+  const u = (raw ?? '').trim();
+  const HOST = '([A-Za-z0-9][A-Za-z0-9.-]*)';
+  const WHERE = '(/[A-Za-z0-9._~/-]*)';
+  let m = new RegExp(`^https://(?:[^@/\\s]*@)?${HOST}(:\\d{1,5})?${WHERE}$`).exec(u);
+  if (m) return `https://${m[1]}${m[2] ?? ''}${m[3]}`;
+  m = new RegExp(`^ssh://(?:([A-Za-z0-9_][A-Za-z0-9._-]*)@)?${HOST}(:\\d{1,5})?${WHERE}$`).exec(u);
+  if (m) return `ssh://${m[1] ? `${m[1]}@` : ''}${m[2]}${m[3] ?? ''}${m[4]}`;
+  m = new RegExp(`^([A-Za-z0-9_][A-Za-z0-9._-]*)@${HOST}:([A-Za-z0-9._~/][A-Za-z0-9._~/-]*)$`).exec(u);
+  if (m) return `${m[1]}@${m[2]}:${m[3]}`;
+  if (opts.files && path.isAbsolute(u) && !/[\0\n\r]/.test(u)) return u;
+  return undefined;
 }
 
 // github.com/mikecann/threadbear, however the URL is written (https, ssh,
@@ -418,6 +658,11 @@ export class Upstream {
   // list (keyChanges).
   private newestVerified?: SignedTag & { tag: string };
   private readonly git: (cwd: string, args: string[], opts?: GitOptions) => Promise<string>;
+  // The release tags GitHub had at publishOnce's last look.
+  private pushedTags = new Set<string>();
+  // origin's URL at publishOnce's last look (fetchableUrl), for its fetches
+  // and pushes.
+  private origin?: string;
   private readonly deps: UpstreamDeps;
 
   private get fetchTimeoutMs(): number {
@@ -426,6 +671,33 @@ export class Upstream {
 
   private get stageMaxBytes(): number {
     return this.deps.stageMaxBytes ?? STAGE_MAX_BYTES;
+  }
+
+  // Release git that talks to upstream or origin (releaseGit, above), and
+  // its upload-pack: git's own.
+  private remote(more: GitOptions = {}): GitOptions {
+    return { network: 'remote', ...(this.deps.localRemotes ? { files: true } : {}), ...more };
+  }
+
+  private get uploadPack(): string {
+    return this.deps.uploadPack ? `--upload-pack=${this.deps.uploadPack}` : UPLOAD_PACK;
+  }
+
+  private url(raw: string | undefined): string | undefined {
+    return fetchableUrl(raw, { files: this.deps.localRemotes });
+  }
+
+  // Why release work can't trust what git reads in `checkout`, or
+  // undefined: replacement refs (refs/replace/) or grafts (info/grafts),
+  // which git uses to read one object in place of another. Release git
+  // already ignores both (releaseGit), so this is the check saying so,
+  // rather than reading a release past them (Daybreak 180, 24 Nov 2026).
+  private async substitutes(checkout: string): Promise<string | undefined> {
+    const replaced = await this.git(checkout, ['for-each-ref', '--count=1', '--format=%(refname)', 'refs/replace/']);
+    if (replaced) return `this checkout has git replacement refs (${replaced.slice(0, 80)}), which could have git read other objects in place of a release's; remove them (git replace -d) and it checks again`;
+    const common = path.resolve(checkout, await this.git(checkout, ['rev-parse', '--git-common-dir']));
+    if (fs.existsSync(path.join(common, 'info', 'grafts'))) return `this checkout has git grafts (${path.join(common, 'info', 'grafts')}), which could have git read other history in place of a release's; remove that file and it checks again`;
+    return undefined;
   }
 
   constructor(deps: UpstreamDeps) {
@@ -457,9 +729,12 @@ export class Upstream {
 
   private tick(): void {
     this.timer = undefined;
-    void this.check().finally(() => {
-      if (!this.stopped) this.timer = this.deps.clock.setTimeout(() => this.tick(), FETCH_INTERVAL_MS);
-    });
+    void this.check()
+      .catch(() => undefined)
+      .then((s) => {
+        const wait = !s || s.state === 'failed' ? RETRY_AFTER_FAILURE_MS : FETCH_INTERVAL_MS;
+        if (!this.stopped) this.timer = this.deps.clock.setTimeout(() => this.tick(), wait);
+      });
   }
 
   private publishTick(): void {
@@ -481,14 +756,24 @@ export class Upstream {
   private async checkNow(): Promise<UpstreamStatus> {
     const checkout = this.deps.checkout;
     if (!checkout) return this.status();
-    const urls = await this.remotes(checkout);
+    let urls: { origin?: string; upstream?: string };
+    try {
+      urls = await this.remotes(checkout);
+    } catch (e) {
+      this.deps.log.warn('could not check upstream for releases', { error: String(e) });
+      return this.set({ state: 'failed', checkedAt: new Date(this.deps.clock.now()).toISOString(), reason: String((e as Error).message ?? e).slice(0, 300) });
+    }
     if (!urls.upstream) return this.set({ state: 'off', reason: "this copy has no upstream remote (Mike's repo), so it has no releases to follow" });
     if (urls.origin && repoKey(urls.origin) === repoKey(urls.upstream)) return this.set({ state: 'off', reason: 'upstream is this repo' });
+    const from = this.url(urls.upstream);
+    if (!from) return this.set({ state: 'off', reason: "upstream's address (remote.upstream.url) isn't an https or ssh one, so releases aren't fetched from it" });
     const signers = signersPath(this.deps.home);
     if (!fs.existsSync(signers)) return this.set({ state: 'off', reason: `no release key pinned at ${signers}; run ./threadbear setup again` });
     this.set({ state: 'checking' });
     const checkedAt = new Date(this.deps.clock.now()).toISOString();
     try {
+      const substituted = await this.substitutes(checkout);
+      if (substituted) throw new Error(substituted);
       // Before the fetch, so an upstream that's gone (or made to fail)
       // can't keep an unverified ref there.
       await this.sweep(checkout, signers);
@@ -512,7 +797,7 @@ export class Upstream {
       const work = fs.mkdtempSync(path.join(parent, 'check-'));
       let release: UpstreamRelease | undefined;
       try {
-        const staged = await this.stageReleases(checkout, signers, path.join(work, 'git'));
+        const staged = await this.stageReleases(checkout, signers, path.join(work, 'git'), from);
         await this.promote(checkout, signers, staged);
         // A release can change which keys count (keyChanges), and so can
         // another runner's check meanwhile (a handover): then what it found
@@ -538,6 +823,10 @@ export class Upstream {
       }
       if (!release) return this.set({ state: 'idle', checkedAt, reason: 'no signed releases yet' });
       const state = release.changes > 0 ? 'available' : 'idle';
+      if (state === 'available') {
+        const changelog = await this.changelogFor(from, release);
+        if (changelog) release = { ...release, changelog };
+      }
       if (state === 'available' && this.st.release?.tag !== release.tag) this.deps.log.info('a newer release from upstream', { tag: release.tag, changes: release.changes });
       const status = this.set({ state, checkedAt, release });
       try {
@@ -552,10 +841,41 @@ export class Upstream {
     }
   }
 
+  // The page's cards for the releases main doesn't have. A failure only
+  // leaves them out: the panel shows the notes instead.
+  private async changelogFor(upstream: string, release: UpstreamRelease): Promise<ReleaseChangelog | undefined> {
+    const tags = release.notes?.length ? release.notes.map((n) => n.tag) : [release.tag];
+    try {
+      return await (this.deps.changelog ?? changelogFor)(repoKey(upstream), tags);
+    } catch (e) {
+      this.deps.log.info('could not read the changelog page; the notes stand in', { error: String(e) });
+      return undefined;
+    }
+  }
+
+  // Each remote's address as configured (the first, as git fetches from),
+  // not as an insteadOf in the checkout's config rewrites it.
   private async remotes(checkout: string): Promise<{ origin?: string; upstream?: string }> {
-    const get = (name: string) => this.git(checkout, ['remote', 'get-url', name]).catch(() => undefined);
+    const get = (name: string) => this.configuredUrl(checkout, name);
     const [origin, upstream] = await Promise.all([get('origin'), get('upstream')]);
     return { origin, upstream };
+  }
+
+  // Undefined when there's none (git config's exit 1), or more than one:
+  // git fetches from the first and `config --get` reads the last, so the
+  // address checked and the one used could differ (Gemini's review).
+  // Anything else that stops git (a config it won't run with) throws.
+  private configuredUrl(checkout: string, name: string): Promise<string | undefined> {
+    return this.git(checkout, ['config', '--get-all', `remote.${name}.url`]).then(
+      (out) => {
+        const urls = out.split('\n').map((u) => u.trim()).filter(Boolean);
+        return urls.length === 1 ? urls[0] : undefined;
+      },
+      (e: unknown) => {
+        if ((e as { exitCode?: unknown }).exitCode === 1) return undefined;
+        throw e;
+      },
+    );
   }
 
   // Fetches a bounded few of upstream's release tags into a folder of their
@@ -579,8 +899,8 @@ export class Upstream {
   //    and each candidate is a ref there, refs/incoming/<date>.
   // checkNow deletes the folder when the check ends, whatever happened, so
   // what didn't verify, and a fetch cut short, leaves nothing behind.
-  private async stageReleases(checkout: string, signers: string, work: string): Promise<string | undefined> {
-    const listed = await this.git(checkout, ['ls-remote', 'upstream', 'refs/heads/main', `refs/tags/${TAG_PREFIX}*`], { timeoutMs: this.fetchTimeoutMs });
+  private async stageReleases(checkout: string, signers: string, work: string, from: string): Promise<string | undefined> {
+    const listed = await this.git(checkout, ['ls-remote', this.uploadPack, from, 'refs/heads/main', `refs/tags/${TAG_PREFIX}*`], this.remote({ timeoutMs: this.fetchTimeoutMs }));
     // Upstream's main: no main, no release can count (STAGED_MAIN).
     const mainOid = listed.split('\n').map((l) => l.split('\t')).find(([oid, ref]) => ref === 'refs/heads/main' && oid && OBJECT_ID.test(oid))?.[0];
     if (!mainOid) return undefined;
@@ -603,9 +923,11 @@ export class Upstream {
     // after every real release, held them all out (Codex's review).
     const objects = path.resolve(checkout, await this.git(checkout, ['rev-parse', '--git-path', 'objects']));
     const format = await this.git(checkout, ['rev-parse', '--show-object-format']).catch(() => 'sha1');
-    await this.git(path.dirname(work), ['init', '-q', '--bare', `--object-format=${format}`, work]);
+    // No template: nothing of anyone's goes in it (hooks, config).
+    await this.git(path.dirname(work), ['init', '-q', '--bare', '--template=', `--object-format=${format}`, work]);
+    fs.mkdirSync(path.join(work, 'objects', 'info'), { recursive: true });
     fs.writeFileSync(path.join(work, 'objects', 'info', 'alternates'), `${objects}\n`);
-    await this.fetchStaged(checkout, work, objects, ['refs/heads/main']);
+    await this.fetchStaged(checkout, work, objects, ['refs/heads/main'], from);
     if (!(await this.git(work, ['cat-file', '-e', `${mainOid}^{commit}`]).then(() => true, () => false))) return undefined;
     await this.git(work, ['update-ref', STAGED_MAIN, mainOid]);
     for (const [name, ref] of await this.refs(checkout, REF_NS)) {
@@ -620,7 +942,7 @@ export class Upstream {
     const unsigned = (name: string) => this.answers.get(`${pinned} ${offered.get(name)} ${TAG_PREFIX}${name}`) === null;
     const names = [...offered.keys()].filter((n) => n <= latest && !unsigned(n)).sort().reverse();
     const candidates = [...names.filter((n) => n >= newest).slice(0, MAX_READS), ...names.filter((n) => n < newest).slice(0, MAX_OLDER)];
-    if (candidates.length) await this.fetchStaged(checkout, work, objects, candidates.map((n) => `refs/tags/${TAG_PREFIX}${n}`));
+    if (candidates.length) await this.fetchStaged(checkout, work, objects, candidates.map((n) => `refs/tags/${TAG_PREFIX}${n}`), from);
     // The ids ls-remote named, where they came (a tag moved in between
     // isn't there, and waits for the next check).
     const updates: string[] = [];
@@ -634,7 +956,7 @@ export class Upstream {
 
   // Fetches `refs` from upstream into the staging folder's objects, with
   // no ref of the checkout's changed, bounded in size and time.
-  private async fetchStaged(checkout: string, work: string, objects: string, refs: string[]): Promise<void> {
+  private async fetchStaged(checkout: string, work: string, objects: string, refs: string[], from: string): Promise<void> {
     await this.git(
       checkout,
       // One pack, never loose objects (unpackLimit), so its size is what's
@@ -643,20 +965,20 @@ export class Upstream {
       // would add refs/tags/*:refs/tags/* and change the checkout's tags
       // (Codex's review).
       ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.writeCommitGraph=false', '-c', 'fetch.unpackLimit=1', '-c', 'transfer.unpackLimit=1',
-        'fetch', '-q', '--no-tags', '--no-prune', '--no-prune-tags', '--no-write-fetch-head', '--no-recurse-submodules', '--refmap=', 'upstream',
+        'fetch', '-q', '--no-tags', '--no-prune', '--no-prune-tags', '--no-write-fetch-head', '--no-recurse-submodules', '--refmap=', this.uploadPack, from,
         ...refs],
-      {
+      this.remote({
         timeoutMs: this.fetchTimeoutMs,
         env: { GIT_OBJECT_DIRECTORY: path.join(work, 'objects'), GIT_ALTERNATE_OBJECT_DIRECTORIES: objects },
         over: () => (folderBytes(path.join(work, 'objects')) > this.stageMaxBytes ? `fetched more than ${Math.round(this.stageMaxBytes / 1024 / 1024)} MB` : undefined),
-      },
+      }),
     );
     if (folderBytes(path.join(work, 'objects')) > this.stageMaxBytes) throw new Error(`git fetch from upstream fetched more than ${Math.round(this.stageMaxBytes / 1024 / 1024)} MB`);
   }
 
   // Copies a staged release's objects into the checkout (no ref changes).
   private async bringIn(checkout: string, work: string, name: string): Promise<void> {
-    await this.git(checkout, ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false', 'fetch', '-q', '--no-tags', '--no-prune', '--no-prune-tags', '--no-write-fetch-head', '--refmap=', work, `${STAGED_NS}${name}`]);
+    await this.git(checkout, ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false', 'fetch', '-q', '--no-tags', '--no-prune', '--no-prune-tags', '--no-write-fetch-head', '--no-recurse-submodules', '--refmap=', UPLOAD_PACK, work, `${STAGED_NS}${name}`], { network: 'local' });
   }
 
 
@@ -738,8 +1060,8 @@ export class Upstream {
     if (!signed) return false;
     const signer = signerKey(signed.signature);
     if (!signer) return false;
-    const file = (f: string) => this.git(checkout, ['show', `${signed.commit}:${f}`]).catch(() => '');
-    const [announced, revoke] = await Promise.all([file(SIGNERS_FILE), file(REVOKED_FILE)]);
+    // Read object by object, each checked against its id (committedFile).
+    const [announced, revoke] = await Promise.all([this.committedFile(checkout, signed.commit, SIGNERS_FILE), this.committedFile(checkout, signed.commit, REVOKED_FILE)]);
     let change;
     try {
       change = applyKeyChanges({ home: this.deps.home, signers, signer, announced: keysIn(announced), revoke: keysIn(revoke), tag: signed.tag, now: this.deps.clock.now() });
@@ -753,6 +1075,40 @@ export class Upstream {
     for (const k of change.refused) this.deps.log.warn("a release tried to revoke a key it can't (only that key or a newer one can)", { key: k.slice(0, 60), tag: signed.tag });
     if (change.waiting.length) this.deps.log.info('a new release key is waiting out its week before it counts', { keys: change.waiting.map((k) => k.slice(0, 60)), tag: signed.tag });
     return change.added.length > 0 || change.revoked.length > 0;
+  }
+
+  // `file` (a/b/c) as the commit `rev` names has it, read object by object
+  // (commit, trees, blob), each one's bytes hashed and checked against its
+  // id: so what's read is what the id names whatever the checkout's objects
+  // say (Daybreak 180: a signature covers a commit id, and git reads an id
+  // through whatever's on disk for it). '' when the commit or the file isn't
+  // there (or is a link); throws when an object isn't what its id says.
+  private async committedFile(cwd: string, rev: string, file: string): Promise<string> {
+    const read = this.deps.gitBytes ?? gitBytes;
+    const commit = OBJECT_ID.test(rev) ? rev : await this.git(cwd, ['rev-parse', '--verify', '--quiet', `${rev}^{commit}`]).catch(() => '');
+    if (!commit) return '';
+    // An object the commit or a tree names that can't be read, or isn't
+    // what its id says, fails the read: taken as no file, a revocation
+    // whose blob went missing would just not happen (Codex's review).
+    const object = async (type: 'commit' | 'tree' | 'blob', oid: string): Promise<Buffer> => {
+      const body = await read(cwd, ['cat-file', type, oid]).catch((e: unknown) => {
+        throw new Error(`the ${type} ${oid.slice(0, 12)} can't be read from this checkout's objects, so the release's ${file} can't be (${String(e).slice(0, 120)})`);
+      });
+      if (!objectIs(type, oid, body)) throw new Error(`the ${type} ${oid.slice(0, 12)} in this checkout's objects isn't the one its id names, so the release's ${file} can't be read`);
+      return body;
+    };
+    const tree = /^tree ([0-9a-f]{40}|[0-9a-f]{64})\n/.exec((await object('commit', commit)).toString('latin1'))?.[1];
+    if (!tree) throw new Error(`the commit ${commit.slice(0, 12)} names no tree`);
+    let oid = tree;
+    const parts = file.split('/');
+    for (let i = 0; i < parts.length; i++) {
+      const entry = treeEntry(await object('tree', oid), parts[i]!, oid.length / 2);
+      const last = i === parts.length - 1;
+      // Not there (or a link, or a folder where a file should be): no file.
+      if (!entry || !(last ? /^100(644|755)$/.test(entry.mode) : entry.mode === '40000')) return '';
+      oid = entry.oid;
+    }
+    return (await object('blob', oid)).toString('utf8');
   }
 
   // Whether `commit` is on upstream's main as this check staged it.
@@ -812,20 +1168,22 @@ export class Upstream {
   // same way, and the text comes from the verified bytes, never from a ref
   // git could move. Their history is only in `staged` (whose objects fall
   // back on the checkout's), so that's where it's compared with main's.
-  private async notesSince(checkout: string, newest: SignedTag & { name: string }, signers: string, staged: string | undefined): Promise<{ tag: string; lines: string[] }[]> {
+  private async notesSince(checkout: string, newest: SignedTag & { name: string }, signers: string, staged: string | undefined): Promise<{ tag: string; date?: string; lines: string[] }[]> {
     const main = await this.git(checkout, ['rev-parse', 'refs/heads/main']);
     const older = [...(staged ? await this.refs(staged, STAGED_NS) : [])]
       .filter(([name]) => RELEASE_NAME.test(name) && name < newest.name)
       .sort(([x], [y]) => (x < y ? 1 : -1))
       .slice(0, 9);
-    const out: { tag: string; lines: string[] }[] = [];
+    const out: { tag: string; date?: string; lines: string[] }[] = [];
     const add = (name: string, signed: SignedTag) => {
       const message = signed.payload.toString('utf8');
       const notes = parseNotes(message);
       // A failed model call, or a tag from before notes existed, still
       // describes that release instead of disappearing behind older notes.
       const lines = notes.length ? notes : message.split('\n').filter((l) => l.startsWith('- ')).slice(0, 5).map((l) => l.slice(2).trim().slice(0, 200)).filter(Boolean);
-      if (lines.length) out.push({ tag: TAG_PREFIX + name, lines });
+      // The date too, so the app can head each one with its day where the
+      // reader is, not Mike's (the name is his day).
+      if (lines.length) out.push({ tag: TAG_PREFIX + name, ...(signed.date ? { date: signed.date } : {}), lines });
     };
     add(newest.name, newest);
     for (const [name, ref] of older) {
@@ -902,19 +1260,65 @@ export class Upstream {
     const tip = await this.git(checkout, ['rev-parse', 'refs/heads/main']);
     const committed = Number(await this.git(checkout, ['log', '-1', '--format=%ct', tip])) * 1000;
     if (now - committed < SETTLE_MS) return undefined;
+    // What it tags and signs is read as its ids name it, or not at all.
+    const substituted = await this.substitutes(checkout);
+    if (substituted) {
+      this.hold({ commit: tip, why: substituted, at: new Date(now).toISOString() });
+      return undefined;
+    }
+    // origin's address as configured, given to git as a URL (fetchableUrl).
+    const origin = this.url(await this.configuredUrl(checkout, 'origin'));
+    if (!origin) {
+      this.hold({ commit: tip, why: "origin's address (remote.origin.url) isn't an https or ssh one, so releases aren't pushed to it", at: new Date(now).toISOString() });
+      return undefined;
+    }
+    this.origin = origin;
     // Tags made on another Mac, or by hand, count too.
-    await this.git(checkout, ['fetch', '-q', '--no-tags', 'origin', `+refs/tags/${TAG_PREFIX}*:refs/tags/${TAG_PREFIX}*`], { timeoutMs: this.fetchTimeoutMs });
+    try {
+      await this.git(checkout, ['fetch', '-q', '--no-tags', '--no-prune', '--no-prune-tags', '--no-recurse-submodules', this.uploadPack, origin, `+refs/tags/${TAG_PREFIX}*:refs/tags/${TAG_PREFIX}*`], this.remote({ owner: true, timeoutMs: this.fetchTimeoutMs }));
+    } catch (e) {
+      // Said where it's seen (a checkout whose config release git won't
+      // run with), as well as logged.
+      this.hold({ commit: tip, why: `couldn't fetch the release tags from origin: ${String((e as Error).message ?? e).slice(0, 200)}`, at: new Date(now).toISOString() });
+      throw e;
+    }
     const tag = tagFor(new Date(now));
-    const tags = (await this.git(checkout, ['tag', '--list', '--sort=-refname', `${TAG_PREFIX}*`])).split('\n').filter(Boolean);
+    // Only tags GitHub has are releases: one made here and never pushed (its
+    // push failed, or it didn't verify and couldn't be deleted, perhaps
+    // before a restart) would otherwise pass for today's, then the last.
+    const pushed = new Set((await this.git(checkout, ['ls-remote', '--refs', this.uploadPack, origin, `refs/tags/${TAG_PREFIX}*`], this.remote({ owner: true, timeoutMs: this.fetchTimeoutMs })))
+      .split('\n').map((l) => l.split('\t')[1]?.slice('refs/tags/'.length)).filter(Boolean));
+    const local = (await this.git(checkout, ['tag', '--list', '--sort=-refname', `${TAG_PREFIX}*`])).split('\n').filter(Boolean);
+    // Named as forks take them (RELEASE_NAME): a release/latest isn't one.
+    const tags = local.filter((t) => pushed.has(t) && RELEASE_NAME.test(t.slice(TAG_PREFIX.length)));
+    this.pushedTags = new Set(tags);
     if (tags.includes(tag)) return this.hold(undefined);
+    if (local.includes(tag)) {
+      const oid = await this.git(checkout, ['rev-parse', '--verify', '--quiet', `refs/tags/${tag}`]).catch(() => '');
+      if (oid && !(await this.dropTag(checkout, tag, oid))) {
+        this.hold({ commit: tip, why: `today's tag ${tag} was made here but never pushed, and it can't be deleted (git tag -d ${tag})`, at: new Date(now).toISOString() });
+        return undefined;
+      }
+    }
     const last = tags[0];
     if (last && (await this.isAncestor(checkout, tip, last))) return this.hold(undefined);
     const why = await this.checksSay(checkout, tip);
-    if (why) {
+    // The tip held by a red check: the newest settled commit since the last
+    // release that's green on everything goes out instead (newestGreen).
+    const target = !why ? tip : this.lastSaid ? await this.newestGreen(checkout, tip, last, now).catch(() => undefined) : undefined;
+    if (why && !target) {
       this.hold({ commit: tip, why, at: new Date(now).toISOString() });
       return undefined;
     }
+    if (why) this.deps.log.info('main is held, so the newest commit green on everything goes out', { tip, commit: target, why });
     this.hold(undefined);
+    return this.tagRelease(checkout, target!, last, tag, now);
+  }
+
+  // Tags `tip` as today's release `tag`, signed, and pushes it.
+  private async tagRelease(checkout: string, tip: string, last: string | undefined, tag: string, now: number): Promise<string | undefined> {
+    const { publish } = this.deps;
+    if (!publish?.signingKey) return undefined;
 
     const range = last ? `${last}..${tip}` : tip;
     const subjects = (await this.git(checkout, ['log', '--no-merges', '--format=- %s', range, '--max-count=200'])).trim();
@@ -939,7 +1343,7 @@ export class Upstream {
     }
     try {
       await this.git(checkout, ['-c', 'gpg.format=ssh', '-c', `user.signingkey=${publish.signingKey}`, 'tag', '-s', '-F', file, tag, tip],
-        touch ? { timeoutMs: TOUCH_SIGN_TIMEOUT_MS, env: { SSH_SK_PROVIDER: publish.signingProvider ?? MAC_SK_PROVIDER } } : {});
+        touch ? { owner: true, timeoutMs: TOUCH_SIGN_TIMEOUT_MS, env: { SSH_SK_PROVIDER: publish.signingProvider ?? MAC_SK_PROVIDER } } : { owner: true });
     } catch (e) {
       if (!touch) throw e;
       await this.git(checkout, ['tag', '-d', tag]).catch(() => undefined);
@@ -947,17 +1351,89 @@ export class Upstream {
       this.deps.log.info('release signature not given; asking again next hour', { tag, error: String(e).slice(0, 200) });
       return undefined;
     }
+    // Checked as a fork checks it before it goes anywhere: on 19 Nov 2026
+    // the Secure Enclave handed back a signature with nothing in it (empty
+    // r and s), git called that signed, and release/2026-11-19 went out
+    // verifying nowhere. The object checked is the one pushed, by its id.
+    const oid = await this.git(checkout, ['rev-parse', '--verify', '--quiet', `refs/tags/${tag}`]).catch(() => '');
+    const bad = !oid ? 'the tag was not there to check' : await this.selfCheck(checkout, tag, oid, tip, last, now).catch((e: unknown) => `ssh-keygen couldn't check it (${String(e).slice(0, 120)})`);
+    if (bad) {
+      const dropped = !oid || (await this.dropTag(checkout, tag, oid));
+      this.hold({ commit: tip, why: `its signature didn't verify, so it wasn't pushed: ${bad}${dropped ? '' : ` (its local tag couldn't be deleted yet; the next look tries again)`}`, at: new Date(now).toISOString() });
+      this.deps.log.warn('release signature does not verify; not pushed', { tag, commit: tip, why: bad, tagDeleted: dropped });
+      return undefined;
+    }
     this.hold(undefined);
     try {
-      await this.git(checkout, ['push', '-q', 'origin', `refs/tags/${tag}`], { timeoutMs: this.fetchTimeoutMs });
+      await this.git(checkout, ['push', '-q', '--no-recurse-submodules', RECEIVE_PACK, this.origin!, `${oid}:refs/tags/${tag}`], this.remote({ owner: true, timeoutMs: this.fetchTimeoutMs }));
     } catch (e) {
       // Taken back, so the next look tries the push again.
-      await this.git(checkout, ['tag', '-d', tag]).catch(() => undefined);
+      await this.dropTag(checkout, tag, oid);
       throw e;
     }
     this.deps.log.info('tagged a release', { tag, commit: tip });
     this.set({ ...this.st, published: { tag, at: new Date(now).toISOString() } });
     return tag;
+  }
+
+  // Deletes the local tag if it's still `oid`. One left behind isn't on
+  // GitHub, so the next look doesn't count it and tries again (publishOnce).
+  private async dropTag(checkout: string, tag: string, oid: string): Promise<boolean> {
+    for (let i = 0; i < 2; i++) {
+      if (await this.git(checkout, ['update-ref', '-d', `refs/tags/${tag}`, oid]).then(() => true, () => false)) return true;
+    }
+    this.deps.log.error('could not delete an unpushed release tag', { tag, oid });
+    return false;
+  }
+
+  // Why the tag object `oid` wouldn't count as `tag` for a fork, or
+  // undefined if it would: the same size limit, split and ssh-keygen check
+  // as verified(), on the commit it was made for. The keys are what forks
+  // hold: those in release-signers at the commit, and at the newest release
+  // a day older than ADD_DELAY_MS (the wait before an announced key counts),
+  // or the oldest release when none is; revoked are those the last
+  // release revoked, as a release that revokes its own key must still go
+  // out for forks to take the revocation in.
+  private async selfCheck(checkout: string, tag: string, oid: string, tip: string, last: string | undefined, now: number): Promise<string | undefined> {
+    const size = Number(await this.git(checkout, ['cat-file', '-s', oid]));
+    if (!(size > 0 && size <= MAX_TAG_BYTES)) return `the tag is ${size} bytes, more than forks read`;
+    const raw = await (this.deps.gitBytes ?? gitBytes)(checkout, ['cat-file', 'tag', oid]);
+    const split = splitSignedTag(raw, tag);
+    if (!split) return 'the tag is not one SSH-signed release tag';
+    if (split.commit !== tip) return `the tag names ${split.commit.slice(0, 8)}, not ${tip.slice(0, 8)}`;
+    const signers = await this.committedFile(checkout, tip, SIGNERS_FILE);
+    if (!keysIn(signers).length) return `${SIGNERS_FILE} has no keys at that commit`;
+    const signer = signerKey(split.signature);
+    const settled = await this.settledRelease(checkout, now);
+    if (settled && signer && !keysIn(await this.committedFile(checkout, `refs/tags/${settled}`, SIGNERS_FILE)).includes(signer)) {
+      return `its key wasn't in ${SIGNERS_FILE} at ${settled}, so forks don't take it yet`;
+    }
+    const revoked = last ? keysIn(await this.committedFile(checkout, `refs/tags/${last}`, REVOKED_FILE)) : [];
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tb-release-self-'));
+    try {
+      const signersFile = path.join(dir, 'signers');
+      const revokedFile = path.join(dir, 'revoked');
+      fs.writeFileSync(signersFile, signers.endsWith('\n') ? signers : `${signers}\n`);
+      if (revoked.length) fs.writeFileSync(revokedFile, revoked.join('\n') + '\n');
+      return (await sshVerified(split, signersFile, revoked.length ? revokedFile : undefined)) ? undefined : `ssh-keygen says it isn't good for any key in ${SIGNERS_FILE}`;
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  // The newest release tag dated a day more than ADD_DELAY_MS ago (forks
+  // look every six hours, and a Mac sleeps), or else the oldest there is.
+  private async settledRelease(checkout: string, now: number): Promise<string | undefined> {
+    const lines = (await this.git(checkout, ['for-each-ref', '--sort=-taggerdate', '--format=%(refname:lstrip=2)%09%(taggerdate:unix)', `refs/tags/${TAG_PREFIX}*`])).split('\n');
+    let oldest: string | undefined;
+    for (const line of lines) {
+      const [name, at] = line.split('\t');
+      if (!name || !(Number(at) > 0) || !this.pushedTags.has(name)) continue;
+      if (Number(at) * 1000 <= now - ADD_DELAY_MS - 24 * 60 * 60_000) return name;
+      oldest = name;
+    }
+    // None that old: the first release's keys are the ones forks pinned.
+    return oldest;
   }
 
   // Plain-words notes for a release, from its commits' subjects and bodies.
@@ -987,11 +1463,11 @@ export class Upstream {
   // that has settled here goes up first (fast-forward only), and its
   // checks are looked at on the next hourly look. Returns why it's held.
   private async pushMain(checkout: string, tip: string): Promise<string | undefined> {
-    await this.git(checkout, ['fetch', '-q', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main'], { timeoutMs: this.fetchTimeoutMs });
+    await this.git(checkout, ['fetch', '-q', '--no-tags', '--no-prune', '--no-prune-tags', '--no-recurse-submodules', this.uploadPack, this.origin!, '+refs/heads/main:refs/remotes/origin/main'], this.remote({ owner: true, timeoutMs: this.fetchTimeoutMs }));
     const theirs = await this.git(checkout, ['rev-parse', 'refs/remotes/origin/main']).catch(() => '');
     if (theirs === tip || (theirs && (await this.isAncestor(checkout, tip, theirs)))) return undefined;
     if (theirs && !(await this.isAncestor(checkout, theirs, tip))) return "main here and GitHub's main have gone different ways";
-    await this.git(checkout, ['push', '-q', 'origin', `${tip}:refs/heads/main`], { timeoutMs: this.fetchTimeoutMs });
+    await this.git(checkout, ['push', '-q', '--no-recurse-submodules', RECEIVE_PACK, this.origin!, `${tip}:refs/heads/main`], this.remote({ owner: true, timeoutMs: this.fetchTimeoutMs }));
     this.deps.log.info('pushed main for its checks', { commit: tip });
     return 'just pushed main to GitHub, so its checks have only started';
   }
@@ -1001,18 +1477,90 @@ export class Upstream {
   // them waits for them, and is held when they can't be read: a release
   // that can wait a day is better than one that doesn't build.
   private async checksSay(checkout: string, tip: string): Promise<string | undefined> {
+    this.lastSaid = false;
     const workflows = (await this.git(checkout, ['ls-tree', '--name-only', tip, '.github/workflows/'])).split('\n').filter((f) => /\.ya?ml$/.test(f));
     if (!workflows.length) return undefined;
     // The URL as configured, not as an insteadOf rewrites it for fetching.
-    const key = repoKey(await this.git(checkout, ['config', '--get', 'remote.origin.url']).catch(() => ''));
+    const key = repoKey(this.origin ?? '');
     if (!key.startsWith('github.com/')) return "origin isn't on GitHub, so its checks can't be read";
     const pushed = await this.pushMain(checkout, tip);
     if (pushed) return pushed;
+    const repo = key.slice('github.com/'.length);
     try {
-      return ciVerdict(await (this.deps.ciRuns ?? githubRuns)(key.slice('github.com/'.length), tip));
+      const runs = await (this.deps.ciRuns ?? githubRuns)(repo, tip);
+      const said = ciVerdict(runs);
+      this.lastSaid = Boolean(said);
+      if (said) return said;
+      const ran = new Set(runs.map((r) => r.file));
+      const quiet = workflows.filter((f) => !ran.has(f));
+      if (!quiet.length) return undefined;
+      // Every commit the tip has, however far back: a workflow whose paths
+      // nothing touches (the frozen Swift app's) can go thousands of
+      // commits without a run.
+      const has = new Set((await this.git(checkout, ['rev-list', tip])).split('\n').filter(Boolean));
+      const held: string[] = [];
+      for (const file of quiet) {
+        const why = earlierVerdict(await (this.deps.ciHistory ?? githubWorkflowRuns)(repo, file), has);
+        if (why) held.push(why);
+      }
+      this.lastSaid = held.length > 0;
+      return held.length ? held.join('; ') : undefined;
     } catch (e) {
       return `couldn't read GitHub's checks (${String(e)})`;
     }
+  }
+
+  // Whether checksSay's last answer came from GitHub's runs (a red, running
+  // or cancelled check), not from main being just pushed, gone another way,
+  // or GitHub not answering: only then is an older commit looked for.
+  private lastSaid = false;
+
+  // The newest commit since `last` (main's first-parent line, the tip left
+  // out) that is as safe to hand on as a green tip: an hour old, the head of
+  // a push GitHub ran checks on, and every workflow in it green by the same
+  // rule as the tip's (earlierVerdict: its run on that commit, or for one
+  // its paths didn't set off, its last finished run on a commit it has).
+  // A commit inside a push isn't one: nothing ran on its changes alone.
+  // Without this one red push held every release: none went out from 16 to
+  // 19 Nov while Windows failed on main, with green commits in between.
+  // It's the same bar the Xcode 26 lesson set (release/2026-11-04 to -06
+  // went out unchecked), only on an older commit. One GitHub request a
+  // workflow, as the hourly look's are counted (60 an hour without a token).
+  private async newestGreen(checkout: string, tip: string, last: string | undefined, now: number): Promise<string | undefined> {
+    const key = repoKey(this.origin ?? '');
+    if (!key.startsWith('github.com/')) return undefined;
+    const repo = key.slice('github.com/'.length);
+    const line = (await this.git(checkout, ['log', '--first-parent', `--max-count=${GREEN_LOOKBACK}`, '--format=%H %ct', tip, ...(last ? [`^${last}`] : [])]))
+      .split('\n')
+      .map((l) => l.trim().split(' '))
+      .filter((p): p is [string, string] => p.length === 2 && p[0] !== tip)
+      .filter(([, ct]) => now - Number(ct) * 1000 >= SETTLE_MS);
+    if (!line.length) return undefined;
+    const histories = new Map<string, CiRun[]>();
+    const historyOf = async (file: string) => {
+      let h = histories.get(file);
+      if (!h) histories.set(file, (h = await (this.deps.ciHistory ?? githubWorkflowRuns)(repo, file)));
+      return h;
+    };
+    const tipHas = new Set((await this.git(checkout, ['rev-list', tip])).split('\n').filter(Boolean));
+    const files = (await this.git(checkout, ['ls-tree', '--name-only', tip, '.github/workflows/'])).split('\n').filter((f) => /\.ya?ml$/.test(f));
+    for (const f of files) await historyOf(f);
+    const ranOn = new Set([...histories.values()].flat().map((r) => r.sha).filter(Boolean));
+    for (const [sha] of line) {
+      if (!ranOn.has(sha)) continue;
+      const mine = (await this.git(checkout, ['ls-tree', '--name-only', sha, '.github/workflows/'])).split('\n').filter((f) => /\.ya?ml$/.test(f));
+      const after = new Set((await this.git(checkout, ['rev-list', `${sha}..${tip}`])).split('\n').filter(Boolean));
+      const has = new Set([...tipHas].filter((c) => !after.has(c)));
+      let green = true;
+      for (const f of mine) {
+        if (earlierVerdict(await historyOf(f), has)) {
+          green = false;
+          break;
+        }
+      }
+      if (green) return sha;
+    }
+    return undefined;
   }
 
   // Says (or stops saying) why today's release is waiting, logging only a
@@ -1091,6 +1639,47 @@ export function splitSignedTag(raw: Buffer, tag: string): SignedTag | undefined 
   const when = / (\d{1,12}) [+-]\d{4}$/.exec(tagger);
   const date = when ? new Date(Number(when[1]) * 1000).toISOString() : undefined;
   return { payload: Buffer.from(payload, 'latin1'), signature, commit, ...(date ? { date } : {}) };
+}
+
+// Whether `body` is the git object `oid` of `type`: its id is the hash of
+// "<type> <size>\0" and its bytes (SHA-1, or SHA-256 for a 64-digit id).
+export function objectIs(type: string, oid: string, body: Buffer): boolean {
+  if (!OBJECT_ID.test(oid)) return false;
+  return createHash(oid.length === 64 ? 'sha256' : 'sha1').update(`${type} ${body.length}\0`).update(body).digest('hex') === oid;
+}
+
+// The entry `name` in a tree object's bytes: "<mode> <name>\0<id bytes>",
+// one after another.
+export function treeEntry(tree: Buffer, name: string, idBytes: number): { mode: string; oid: string } | undefined {
+  const want = Buffer.from(name, 'utf8');
+  let i = 0;
+  while (i < tree.length) {
+    const sp = tree.indexOf(0x20, i);
+    const nul = sp < 0 ? -1 : tree.indexOf(0, sp + 1);
+    if (nul < 0 || nul + 1 + idBytes > tree.length) return undefined;
+    if (tree.subarray(sp + 1, nul).equals(want)) return { mode: tree.toString('latin1', i, sp), oid: tree.subarray(nul + 1, nul + 1 + idBytes).toString('hex') };
+    i = nul + 1 + idBytes;
+  }
+  return undefined;
+}
+
+// A release tag, kept as REF_NS<name> or a release/<name> tag, if it's
+// what sweep and newestSigned would believe: a tag object no bigger than
+// Mike's runner makes, signed by the pinned key as release/<name>. For
+// readers outside a check (tb checkup), as a ref may have turned up since
+// the last sweep. Read with replacement objects off, as a refs/replace/
+// entry could put other bytes in its place. Undefined for anything else,
+// with no key pinned, or when ssh-keygen can't be run.
+export async function verifiedRelease(checkout: string, home: string, name: string, ref: { oid: string; type: string; size: number }): Promise<SignedTag | undefined> {
+  const signers = signersPath(home);
+  if (!RELEASE_NAME.test(name) || !readable(ref) || !fs.existsSync(signers)) return undefined;
+  try {
+    const raw = await runGit(checkout, ['cat-file', 'tag', ref.oid], { env: { GIT_NO_REPLACE_OBJECTS: '1' } });
+    const split = splitSignedTag(raw, TAG_PREFIX + name);
+    return split && (await sshVerified(split, signers, revokedPath(home))) ? split : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // Whether ssh-keygen finds the signature good for the `git` namespace, by a

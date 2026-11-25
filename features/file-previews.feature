@@ -14,6 +14,23 @@ Feature: Files opened in the side pane
     When I press Back in the pane
     Then the pane shows Highlights
 
+  # The runner restarts onto main several times a day, and the pane reads
+  # every file through it. A link Mike clicked on an ask's card during one
+  # (17 Nov) left the pane saying "Not connected" for good, which looked like
+  # the link doing nothing. GPUI's only, as the Swift app is frozen. On
+  # Windows the app reads this machine's files itself (main.rs `call`), not
+  # through the runner, so nothing waits there and the picture just opens:
+  # its failure picture on CI showed it open. Gone for 10 seconds, so a
+  # slow machine still clicks before the runner's back.
+  @file.host @swift-pending
+  Scenario: A file clicked while the runner restarts opens once it's back
+    When I open the thread "Rebuild the three landing pages"
+    And the runner restarts and is gone for 10 seconds
+    And the app has lost the runner
+    And I click the highlight "pricing-before.png"
+    Then the pane's note reads "Waiting for the runner. This opens once it's back." on a Mac or Linux
+    And the pane shows a picture
+
   # The Swift app is frozen (AGENTS.md, "The GPUI port"), so this is GPUI's only.
   @file.restore @swift-pending
   Scenario: A file open in the pane is open again after a relaunch, until Back closes it
@@ -98,6 +115,18 @@ Feature: Files opened in the side pane
     And I open "screens/hero-walkthrough.mp4" in the thread's folder in the pane
     Then the pane is showing the file "screens/hero-walkthrough.mp4"
     And the pane shows a video 1600 by 1058
+
+  # A sound file plays in the same player, its controls a bar across the
+  # middle of the pane (Mike, 24 Nov: "You should be able to play these
+  # inside of Threadbear"). On Windows and Linux it opens in its own app.
+  @file.video @swift-pending @windows-pending @linux-pending
+  Scenario: A sound file plays in the pane
+    When I open the thread "Rebuild the three landing pages"
+    And I open "recordings/standup-note.wav" in the thread's folder in the pane
+    Then the pane is showing the file "recordings/standup-note.wav"
+    And the pane shows a sound player
+    When I press play on the sound in the pane
+    Then the sound in the pane is playing
 
   # A panel in a window of its own can't place the player yet, so the video
   # stops and goes with the pane, and says it shows in the main window

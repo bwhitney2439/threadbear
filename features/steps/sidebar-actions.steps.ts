@@ -1,6 +1,7 @@
 import { Given, Then, When } from '@cucumber/cucumber';
 import assert from 'node:assert/strict';
 import type { ThreadbearWorld } from '../support/world.ts';
+import { sleep } from '../support/driver.ts';
 
 /** A list of titles from a dump's text: "ok [...]" or "ok shown true [...]". */
 function listIn(result: string): string[] {
@@ -40,8 +41,11 @@ Given('the {string} section is folded away', async function (this: ThreadbearWor
   await this.until(`${key} folded`, (d) => d.sidebar.sections.find((s) => s.name.toLowerCase() === key)?.collapsed === true);
 });
 
+// After the grey loading rows: another Mac's threads are in the dump before
+// this runner's first list lands, and under a slow runner the hover's buttons
+// were clicked while only the loading rows were drawn (24 Nov).
 When('I hover the row {string}', async function (this: ThreadbearWorld, title: string) {
-  const t = await this.until(`a thread called "${title}"`, (d) => this.thread(d, title));
+  const t = await this.until(`a thread called "${title}" drawn`, (d) => (d.sidebar.loading ? undefined : this.thread(d, title)));
   await this.app.do({ cmd: 'hover', id: t.id });
 });
 
@@ -54,8 +58,21 @@ Then('the row {string} offers the buttons {string}', async function (this: Threa
   });
 });
 
+// A control kept disabled until its last press lands (the librarian's Pause,
+// a schedule's) already shows its next state, so a spec reached its next
+// press while it was still disabled and the click did nothing (21 Nov, under
+// a slow runner). `enabled` has the app refuse it then, and it's tried again.
 When('I press the row button {string}', async function (this: ThreadbearWorld, tip: string) {
-  await this.app.do({ cmd: 'click', tipPrefix: tip });
+  const deadline = Date.now() + 15_000;
+  for (;;) {
+    try {
+      await this.app.do({ cmd: 'click', tipPrefix: tip, enabled: true });
+      return;
+    } catch (e) {
+      if (!/ is disabled/.test(String(e)) || Date.now() > deadline) throw e;
+      await sleep(100);
+    }
+  }
 });
 
 Then('no thread is open', async function (this: ThreadbearWorld) {
@@ -104,9 +121,25 @@ When('a check-in is booked on {string}', async function (this: ThreadbearWorld, 
   await this.app.do({ cmd: 'mock', method: 'checkIn', params: { title } });
 });
 
+// Its agent ended the turn waiting on another thread (end_turn's waitFor),
+// or on the app restarting onto what it landed (the mock's `waitOn`).
+When('{string} waits on {string}', async function (this: ThreadbearWorld, title: string, on: string) {
+  await this.app.do({ cmd: 'mock', method: 'waitOn', params: { title, on } });
+});
+
+When('{string} waits for the app update', async function (this: ThreadbearWorld, title: string) {
+  await this.app.do({ cmd: 'mock', method: 'waitOn', params: { title, app: true } });
+});
+
 // Under Hibernating for its schedule: when that runs, in the time's place
 // ("3:05 pm" today, "Mon 9:00 am" otherwise; the clock's own style).
 Then('the row {string} says when its schedule messages it', async function (this: ThreadbearWorld, title: string) {
   const pattern = /^([A-Z][a-z]{2} )?\d{1,2}[:.]\d{2}(\s?[ap]\.?m\.?)?$/i;
   await this.until(`"${title}" saying when its schedule runs`, (d) => pattern.test(this.thread(d, title)?.trailing ?? ''));
+});
+
+// The real right click, with the menu left up (`keep`) for what comes next.
+When('I right-click the row {string} and leave its menu open', async function (this: ThreadbearWorld, title: string) {
+  await this.until(`a thread called "${title}"`, (d) => this.thread(d, title));
+  await this.app.do({ cmd: 'realMenu', tipPrefix: `${title}\n`, right: true, keep: true });
 });

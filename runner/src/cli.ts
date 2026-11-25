@@ -4,23 +4,27 @@ import { startedByFlags } from './started-by-flags.ts';
 import fs from 'node:fs';
 import path from 'node:path';
 import { loadConfig, runnerUrl, RunnerJsonError } from './config.ts';
-import { connectTb, ownerOnly } from './tb-connect.ts';
+import { connectTb, onDisk, ownerOnly } from './tb-connect.ts';
 import { RunnerClient } from './client.ts';
 import { poolLine, sameEmailWarnings } from './pools.ts';
 import { providerName } from './providers.ts';
 import type { Account, ImageRef, Pool, LibrarianStatus, PersistedEvent, Project, RunnerDefaults, Schedule, ThreadSummary } from './protocol.ts';
 import type { Settings } from './settings.ts';
 import { backgroundFlag } from './protocol.ts';
-import { parseWhen as parseLater, relativeFuture } from './when.ts';
+import { parseIsoTime, parseWhen as parseLater, relativeFuture } from './when.ts';
 import { DEV_HELP, formatModels, logsCommand, runDev } from './tb-dev.ts';
 import { findWorktreePatch, isInside } from './patches.ts';
+import { patchCheckCommand } from './patch-check.ts';
 import { TRUST_ALL } from './patch-trust.ts';
 import { checkoutTop, land, landTargetFromGit, realpath, type LandTarget } from './worktrees.ts';
-import { landRefusal } from './follow-origin.ts';
-import { gateCacheDir, gh, landHold } from './land-gate.ts';
+import { landRefusal, pushAfterLanding } from './follow-origin.ts';
+import { gateCacheDir, gh } from './land-gate.ts';
+import { sayRedOnLanding, sendParams, watchRed, type FixThreads } from './red-watch.ts';
+import { WORKER_ENV, detachable, landInBackground, landWorker } from './land-detach.ts';
 import { activityCommand } from './activity.ts';
 import { runnerKeysCommand } from './runner-keys.ts';
 import { pickRunner } from './moves.ts';
+import { staleRelease } from './release.ts';
 
 const OPTIONS = {
   cwd: { type: 'string' },
@@ -31,6 +35,9 @@ const OPTIONS = {
   model: { type: 'string' },
   effort: { type: 'string' },
   ask: { type: 'boolean' },
+  // tb checkup --post / --skip (checkup.ts).
+  post: { type: 'boolean' },
+  skip: { type: 'boolean' },
   auto: { type: 'boolean' },
   plan: { type: 'boolean' },
   full: { type: 'boolean' },
@@ -38,6 +45,8 @@ const OPTIONS = {
   image: { type: 'string', multiple: true },
   wait: { type: 'boolean' },
   json: { type: 'boolean' },
+  // tb unarchive --wrong-hide: the quiet inbox shouldn't have hidden it.
+  'wrong-hide': { type: 'boolean' },
   snoozed: { type: 'boolean' },
   archived: { type: 'boolean' },
   all: { type: 'boolean' },
@@ -56,6 +65,8 @@ const OPTIONS = {
   remove: { type: 'boolean' },
   'dry-run': { type: 'boolean' },
   'despite-red': { type: 'boolean' },
+  quiet: { type: 'boolean' },
+  'allow-format': { type: 'string' },
   // tb-dev.ts
   last: { type: 'string' },
   tools: { type: 'boolean' },
@@ -105,7 +116,7 @@ const HELP = `tb: talk to the Threadbear runner
   tb approve <threadId> <approvalId> [allow|allowAlways|deny]
   tb answer <threadId> <approvalId> "answer"
   tb snooze <threadId> <ISO time or 30m, 2h, 1d, or restart>
-  tb archive <threadId>      tb unarchive <threadId>
+  tb archive <threadId>      tb unarchive <threadId> [--wrong-hide]
   tb move <threadId> <folder>
   tb move <threadId> --to <runner> [--cwd DIR] [--account ID] [--preview]
                                   moves the thread whole to another of your machines
@@ -113,9 +124,11 @@ const HELP = `tb: talk to the Threadbear runner
                                   stops it, without moving
   tb delete <threadId>
   tb accounts                     the Claude and Codex logins (* new threads start on it)
+  tb accounts --json              every login with its usage (weekly %, resets) as JSON
   tb accounts <account> [--json]  that account's models and its default
   tb pools [--json]               the pools, their logins and room (* new threads start on it)
   tb actions <threadId> [--json]  the thread's actions, panels and patches (from its folder)
+  tb patch-check <file.ts>... [--json]  loads patch files now: each one's load error, or the ids it gives
   tb highlights <threadId> [--json]  what the thread made, shared and pinned, and the librarian's brief
   tb panel <threadId> <panelId> [--json]  draws an image panel or fills a list panel now
   tb show-panel <threadId> <panel> [--reload] [--json]  opens a panel when the user looks at that thread (--reload: its page afresh)
@@ -144,13 +157,21 @@ const HELP = `tb: talk to the Threadbear runner
   tb models try <job> "text" [--labels a,b] [--field name=description]... [--system S] [--cwd DIR]
                                   one call by hand: classify (--labels), extract (--field),
                                   summarize or generate. It spends like any other
-  tb land [--dry-run] [--despite-red]
+  tb land [--dry-run] [--allow-format <id>] [--full]
                                   in a thread's own worktree: rebase its branch on main, run
-                                  the repo's check, then move main to it (never pushes);
+                                  the repo's check, then move main to it (and push it, only in a
+                                  repo listed in runner.json's pushAfterLanding);
                                   --dry-run stops before main moves. A GitHub workflow
-                                  marked "# tb land: hold while red" holds the landings it
-                                  would run for while it's red on main; --despite-red
-                                  lands anyway, for the fix
+                                  marked "# tb land: hold while red" that this sets off and is
+                                  red on main gets a line saying so; it lands anyway. A branch changing a format command
+                                  in .git-blame-ignore-revs or a config file one runs with lands
+                                  only with the --allow-format id it shows for exactly those.
+                                  --full runs every step, even those that passed before with
+                                  the same files
+  tb red-watch [--quiet]          in a checkout: starts a thread to fix each workflow marked
+                                  "# tb land: hold while red" gone red on main, and tells it
+                                  when it fails again or passes (a schedule's check runs it
+                                  with --quiet, which prints only when it couldn't)
   tb runner add <name> (--ssh <host> | --out <file>) [--id <runnerId>]
                                   on the main Mac: a backend key for another runner that acts
                                   as that runner alone, written over ssh into its
@@ -194,10 +215,11 @@ const COMMAND_FLAGS: Record<string, string[]> = {
   answer: [],
   snooze: [],
   archive: [],
-  unarchive: [],
+  unarchive: ['wrong-hide'],
   move: ['to', 'cwd', 'account', 'preview', 'json'],
   delete: [],
   accounts: ['json'],
+  'patch-check': ['json'],
   pools: ['json'],
   schedule: ['at', 'cron', 'tz', 'title', 'thread', 'cwd', 'account', 'pool', 'model', 'effort', 'ask', 'auto', 'full', 'json'],
   schedules: ['json', 'text', 'title', 'at', 'cron', 'tz', 'cwd', 'account', 'pool', 'model', 'effort', 'ask', 'auto', 'full'],
@@ -207,6 +229,7 @@ const COMMAND_FLAGS: Record<string, string[]> = {
   models: ['json', 'remove', 'labels', 'field', 'system', 'cwd'],
   status: ['json'],
   updates: ['json'],
+  checkup: ['text', 'post', 'skip', 'json'],
   self: ['json'],
   restart: ['now', 'force', 'resume', 'no-resume', 'cancel', 'reason', 'thread', 'max-wait'],
   show: ['last', 'tools'],
@@ -214,14 +237,17 @@ const COMMAND_FLAGS: Record<string, string[]> = {
   activity: ['since', 'thread', 'summary', 'json'],
   export: ['out'],
   rpc: [],
-  land: ['dry-run', 'despite-red'],
+  land: ['dry-run', 'despite-red', 'allow-format', 'full'],
+  'red-watch': ['quiet'],
   runner: ['ssh', 'out', 'id', 'json', 'finish', 'replace', 'drop', 'snapshot', 'keys-checked', 'lock-out', 'purge'],
 };
 
 // Read but never listed when a command refuses a flag: an agent that sees
 // --force in "It takes ..." learns to cut every thread's work short (tb
 // restart --now --force) or withdraw someone else's deploy.
-const HIDDEN_FLAGS = new Set(['force']);
+// --despite-red did something until 24 Nov, when red stopped holding a
+// landing: taken still, so a habit or an old script doesn't fail.
+const HIDDEN_FLAGS = new Set(['force', 'despite-red']);
 
 // `tb show --help`: the help lines for that command (its usage line and
 // the indented lines under it), or undefined for a command it doesn't know.
@@ -263,6 +289,14 @@ async function main(argv: string[]): Promise<number> {
       return 2;
     }
   }
+  // A tb older or newer than the release this Mac runs (release.ts,
+  // staleRelease). Not again from tb land's background worker, the same tb.
+  const stale = process.env[WORKER_ENV] ? undefined : staleRelease();
+  if (stale) {
+    // Quoted, as the data dir's path has a space on a Mac (Application Support).
+    const tb = process.platform === 'win32' ? `"${stale.tb}"` : `'${stale.tb.replace(/'/g, `'\\''`)}'`;
+    console.error(`tb: this is release ${stale.mine}'s tb, but the runner's current release is ${stale.current}: run ${tb} instead. (A thread keeps the PATH it started with.)`);
+  }
   let cfg: ReturnType<typeof loadConfig>;
   try {
     cfg = loadConfig();
@@ -276,13 +310,25 @@ async function main(argv: string[]): Promise<number> {
     cfg = loadConfig(process.env, { readOnly: true });
   }
   if (cmd === 'logs') return logsCommand(cfg, values);
+  // Loads patch files here, not in the runner: no runner needed.
+  if (cmd === 'patch-check') return patchCheckCommand(args, Boolean(values.json));
   // The app's activity log is files on this Mac: no runner needed.
   if (cmd === 'activity') return activityCommand(cfg, values);
   // Works with no runner too: from any thread/ worktree, by git alone.
-  if (cmd === 'land') return landCommand(cfg, Boolean(values['dry-run']), Boolean(values['despite-red']));
+  // In a process of its own, which a time limit stopping this tb can't
+  // reach once its check has started (land-detach.ts).
+  if (cmd === 'land') {
+    const worker = landWorker();
+    if (!worker && detachable()) return landInBackground(argv);
+    return landCommand(cfg, Boolean(values['dry-run']), worker?.onLocked, typeof values['allow-format'] === 'string' ? values['allow-format'] : undefined, Boolean(values.full));
+  }
   // tb runner uses this Mac's keys straight from disk, so the runner never
   // sees them to refuse them (tb-connect.ts).
   if (cmd === 'runner') {
+    // The data dir as the disk has it now, once: the check and the command
+    // both use this path, so a link swapped after the check can't send the
+    // command to another folder's keys (Codex's fourth review).
+    cfg = { ...cfg, home: onDisk(cfg.home) };
     const why = await ownerOnly(cfg);
     if (why) {
       console.error(why);
@@ -334,7 +380,7 @@ type Flags = Record<string, string | boolean | string[] | undefined>;
 // worktrees of their own with its THREADBEAR_THREAD_ID, and went for the
 // parent's (GPUI port thread, 11 Nov). The check is the one in that
 // worktree's own patch, so a branch that changes it lands under its own.
-async function landCommand(cfg: ReturnType<typeof loadConfig>, dryRun: boolean, despiteRed = false): Promise<number> {
+async function landCommand(cfg: ReturnType<typeof loadConfig>, dryRun: boolean, onLocked?: () => boolean, allowFormat?: string, full = false): Promise<number> {
   const here = process.cwd();
   let target: Omit<LandTarget, 'check'> | undefined;
   let from = here;
@@ -374,15 +420,29 @@ async function landCommand(cfg: ReturnType<typeof loadConfig>, dryRun: boolean, 
     console.error(refused);
     return 1;
   }
+  // Each red workflow is said once, though the landing asks twice.
+  const saidRed = new Set<string>();
   return land(target, {
     dryRun,
     checkFrom: path.relative(realpath(target.path), realpath(from)),
     // Read after the landing lock and rebase: main may have changed the
     // check while we waited. Running tb land asks for this patch's check.
     readCheck: async () => (await findWorktreePatch(from, undefined, undefined, undefined, TRUST_ALL, true))?.check,
-    // A workflow red on main holds what it would run for (land-gate.ts).
-    despiteRed,
-    hold: (root, files) => { const dir = gateCacheDir(root); return landHold(root, files, (line) => console.log(line), gh, dir ? { dir } : undefined); },
+    ...(allowFormat ? { allowFormat } : {}),
+    // The whole check, no step skipped for having passed before.
+    full,
+    // A workflow red on main that this sets off gets a line, and holds
+    // nothing (red-watch.ts).
+    hold: async (root, files) => {
+      const dir = gateCacheDir(root);
+      await sayRedOnLanding(root, files, (line) => console.log(line), gh, dir ? { dir } : undefined, saidRed);
+      return undefined;
+    },
+    // Main goes to GitHub once it has landed, on the owner's Mac only.
+    push: !dryRun && pushAfterLanding(cfg.home, target.mainCheckout),
+    // Stopped while it waits, it says it's out of the line, then exits.
+    sayWhenStopped: true,
+    ...(onLocked ? { onLocked } : {}),
   });
 }
 
@@ -416,6 +476,30 @@ async function threadFromRunner(cfg: ReturnType<typeof loadConfig>, threadId: st
   }
 }
 
+// The threads tb red-watch starts and tells (red-watch.ts), as `tb new
+// --from GitHub` would start one; it tells one with the runner's note
+// (origin "runner"), as `tb send` would put words in Mike's mouth.
+function fixThreads(client: RunnerClient): FixThreads {
+  let all: Promise<ThreadSummary[]> | undefined;
+  const list = () => (all ??= client.call<{ threads: ThreadSummary[] }>('threads.list', { include: ['inbox', 'snoozed', 'archived'] }).then((r) => r.threads));
+  return {
+    state: async (id) => {
+      const t = (await list()).find((x) => x.id === id);
+      return !t ? 'gone' : t.archivedAt ? 'archived' : 'open';
+    },
+    findOpen: async ({ why, title, cwd }) =>
+      (await list()).find((t) => !t.archivedAt && t.startedBy?.label === 'GitHub' && (t.startedBy.why === why || t.title === title) && [t.cwd, t.worktree?.mainCheckout].some((d) => d !== undefined && sameDir(d, cwd)))?.id,
+    start: async ({ text, why, title, cwd }) => {
+      const startedBy = startedByFlags({ from: 'GitHub', why, icon: 'wrench.and.screwdriver' }, process.env.THREADBEAR_THREAD_ID);
+      // Not under the thread that ran tb red-watch, if one did.
+      const r = await client.call<{ thread: ThreadSummary }>('threads.create', { text, cwd, title, images: [], detached: true, ...(startedBy ? { startedBy } : {}) });
+      return r.thread.id;
+    },
+    send: async (threadId, text, why) => {
+      await client.call('threads.send', sendParams(threadId, text, why));
+    },
+  };
+}
 
 async function run(client: RunnerClient, cmd: string, args: string[], f: Flags): Promise<number> {
   const images = async (): Promise<ImageRef[]> => {
@@ -525,13 +609,23 @@ async function run(client: RunnerClient, cmd: string, args: string[], f: Flags):
       console.log(`snoozed until ${r.thread.snoozedUntilRelease ? 'a new release' : r.thread.snoozedUntilRestart ? 'the runner restarts' : r.thread.snoozedUntil}`);
       return 0;
     }
+    case 'red-watch': {
+      const root = await checkoutTop(process.cwd());
+      if (!root) throw new Error('tb red-watch runs in a checkout of the repo whose workflows it watches.');
+      const did = await watchRed(root, { gh, threads: fixThreads(client) });
+      if (!f.quiet) for (const line of did) console.log(line);
+      return 0;
+    }
     case 'archive':
     case 'unarchive': {
       const id = await resolveId(client, args[0]);
       if (cmd === 'archive') notSelf(id, STOPS_SELF);
       // Run from a thread (its agent), it's the agent archiving, not Mike.
       const by = cmd === 'archive' && process.env.THREADBEAR_THREAD_ID ? { archivedBy: 'agent' } : {};
-      await client.call('threads.update', { threadId: id, archived: cmd === 'archive', ...by });
+      // Mike saying the quiet inbox shouldn't have hidden it (its daily
+      // review thread asks him): brought back, written down as a wrong hide.
+      const wrong = cmd === 'unarchive' && f['wrong-hide'] ? { verdict: 'shouldHaveShown' } : {};
+      await client.call('threads.update', { threadId: id, archived: cmd === 'archive', ...by, ...wrong });
       return 0;
     }
     case 'highlights': {
@@ -568,7 +662,7 @@ async function run(client: RunnerClient, cmd: string, args: string[], f: Flags):
       }
       if (r.note) console.log(r.note);
       if (r.image) console.log(r.image.path);
-      for (const item of r.items ?? []) console.log(`  ${item.tone === 'done' ? '✓' : item.tone === 'failed' ? '✗' : item.tone === 'attention' ? '!' : '·'} ${item.title}${item.detail ? `  ${item.detail}` : ''}`);
+      for (const item of r.items ?? []) console.log(`  ${item.tone === 'done' ? '✓' : item.tone === 'failed' ? '✗' : item.tone === 'attention' ? '!' : item.tone === 'warning' ? '▲' : item.tone === 'working' ? '…' : '·'} ${item.title}${item.detail ? `  ${item.detail}` : ''}`);
       return 0;
     }
     case 'actions': {
@@ -632,6 +726,25 @@ async function run(client: RunnerClient, cmd: string, args: string[], f: Flags):
           return 0;
         }
         console.log(formatModels(a, r.defaults));
+        return 0;
+      }
+      if (f.json) {
+        // Every login with the runner's merged usage (this runner's turns,
+        // Token Stats' limits.json and other runners' shared readings), the
+        // same view list_accounts and the apps get, for scripts that check
+        // room left: usage.json alone is only this runner's own readings.
+        const accounts = r.accounts.map((a) => ({
+          id: a.id,
+          provider: a.provider,
+          title: a.title,
+          email: a.email,
+          note: a.note,
+          isDefault: a.id === r.defaults.accountId,
+          signedOut: a.signedOut,
+          planEnded: a.planEnded,
+          usage: a.usage,
+        }));
+        console.log(JSON.stringify({ accounts, defaultAccountId: r.defaults.accountId }, null, 2));
         return 0;
       }
       for (const a of r.accounts) {
@@ -776,8 +889,7 @@ async function run(client: RunnerClient, cmd: string, args: string[], f: Flags):
       return 0;
     }
     case 'settings': {
-      // tb settings full on|off: full sync (docs/full-convex.md), the one
-      // setting the runner asks about by itself (convex-use.ts askBrief).
+      // tb settings full on|off: full sync (docs/convex-backend.md, "Full sync").
       if (args[0] === 'full') {
         const v = args[1];
         if (v !== 'on' && v !== 'off') {
@@ -940,10 +1052,10 @@ async function moveToRunner(client: RunnerClient, threadId: string, f: Flags): P
   if (typeof f.cwd === 'string') params.cwd = f.cwd;
   if (typeof f.account === 'string') params.accountId = f.account;
   if (f.preview) {
-    const p = await client.call<{ cwd?: string; accountId?: string; leftBehind: string[]; problems: string[]; worktree?: boolean; clone?: string }>('threads.movePreview', params);
+    const p = await client.call<{ cwd?: string; accountId?: string; leftBehind: string[]; problems: string[]; worktree?: boolean; clone?: string; cloneFrom?: string }>('threads.movePreview', params);
     if (f.json) console.log(JSON.stringify(p, null, 2));
     else {
-      if (p.cwd) console.log(`${p.worktree ? 'A new worktree in' : 'In'} ${p.cwd}${p.clone ? ` (cloned to ${p.clone} first)` : ''}, on ${p.accountId}`);
+      if (p.cwd) console.log(`${p.worktree ? 'A new worktree in' : 'In'} ${p.cwd}${p.clone ? ` (cloned${p.cloneFrom ? ` from ${p.cloneFrom}` : ''} to ${p.clone} first)` : ''}, on ${p.accountId}`);
       for (const l of p.leftBehind) console.log(`Won't come: ${l}`);
       for (const l of p.problems) console.log(`Can't move: ${l}`);
     }
@@ -960,8 +1072,8 @@ function parseWhen(s: string): string {
     const ms = Number(m[1]) * { m: 60_000, h: 3_600_000, d: 86_400_000 }[m[2] as 'm' | 'h' | 'd'];
     return new Date(Date.now() + ms).toISOString();
   }
-  const t = Date.parse(s);
-  if (Number.isNaN(t)) throw new Error(`Can't read the time ${s}`);
+  const t = parseIsoTime(s);
+  if (t === undefined) throw new Error(`Can't read the time ${s}`);
   return new Date(t).toISOString();
 }
 
@@ -1075,11 +1187,15 @@ async function tail(
     // running it stops after the backlog.
     let running: string | undefined;
     let backlogDone = false;
+    let untilTurn = opts.untilTurn;
     const check = (e: any, live: boolean) => {
       if (e.type === 'turn.started') running = e.turnId;
+      // The message waited in the queue, then went into the running turn
+      // (sent during a cold compaction): that turn answers it.
+      if (untilTurn && e.type === 'user.message' && e.sentAs === untilTurn && typeof e.turnId === 'string') untilTurn = e.turnId;
       if (e.type !== 'turn.completed') return;
       if (e.turnId === running) running = undefined;
-      const end = opts.untilTurn ? e.turnId === opts.untilTurn : opts.untilDone && (live || backlogDone) && !running;
+      const end = untilTurn ? e.turnId === untilTurn : opts.untilDone && (live || backlogDone) && !running;
       if (end) done(e.outcome === 'failed' ? 1 : 0);
     };
     const held: any[] = [];
@@ -1123,7 +1239,8 @@ async function tail(
 // Exit only once stdout has drained: into a pipe Node writes it
 // asynchronously, and exiting straight away cut `tb list --json | ...`
 // off partway (at 64 or 128 KB).
-main(process.argv.slice(2)).then((code) => process.stdout.write('', () => process.exit(code)));
+// A failure in main is Node's own: it prints the stack and exits 1.
+void main(process.argv.slice(2)).then((code) => process.stdout.write('', () => process.exit(code)));
 
 // ------------------------------------------------------------- projects
 

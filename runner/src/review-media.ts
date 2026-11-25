@@ -1,15 +1,15 @@
-// Videos and HTML pages in design reviews (show_options): the copy the
-// thread keeps, and a still of each. The still is the shot's `image`, which
+// Videos, sounds and HTML pages in design reviews (show_options): the copy
+// the thread keeps, and a still of each (a sound's is its waveform). The still is the shot's `image`, which
 // the window's thumbnails and side-by-side cells show and which a client
 // from before videos and pages shows in their place; `media` is what the
-// window plays or shows on the stage (docs/protocol.md, "Design reviews").
+// window plays or shows on the stage (docs/protocol/events.md, "Design reviews").
 import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { cssUrlCaptures, cutQueryAndHash } from './linear-text.ts';
-import { copyImageInto, readImageInfo, readVideoInfo } from './media.ts';
+import { copyImageInto, readAudioInfo, readImageInfo, readVideoInfo } from './media.ts';
 import type { ImageRef } from './protocol.ts';
 
 const MAC = process.platform === 'darwin';
@@ -19,9 +19,22 @@ const STILL_PX = 1600;
 const maxPageAssets = 100;
 const maxPageAssetBytes = 50 * 1024 * 1024;
 
-export function copyReviewMedia(dir: string, src: string, kind: 'video' | 'page'): { image: ImageRef; media: ImageRef } {
-  const media = kind === 'video' ? copyVideo(dir, src) : copyPage(dir, src);
+export type ReviewMediaKind = 'video' | 'audio' | 'page';
+
+export function copyReviewMedia(dir: string, src: string, kind: ReviewMediaKind): { image: ImageRef; media: ImageRef } {
+  const media = kind === 'video' ? copyVideo(dir, src) : kind === 'audio' ? copyAudio(dir, src) : copyPage(dir, src);
   return { image: stillOf(dir, media.path, kind), media };
+}
+
+const AUDIO_EXT: Record<string, string> = { 'audio/mpeg': 'mp3', 'audio/mp4': 'm4a', 'audio/aac': 'aac', 'audio/wav': 'wav' };
+
+function copyAudio(dir: string, src: string): ImageRef {
+  const info = readAudioInfo(src);
+  if (!info) throw new Error(`Not a sound: ${path.basename(src)}`);
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `${crypto.randomUUID()}.${AUDIO_EXT[info.mediaType]}`);
+  fs.copyFileSync(src, file);
+  return { path: file, mediaType: info.mediaType };
 }
 
 function copyVideo(dir: string, src: string): ImageRef {
@@ -97,9 +110,11 @@ export function withCharset(bytes: Buffer): Buffer {
 // they're inside `root`. Links to other pages aren't followed.
 export function namedFiles(text: string, base: string, root: string): string[] {
   const refs: string[] = [];
-  for (const m of text.matchAll(/\b(?:src|href|poster|data)\s*=\s*["']([^"']+)["']/gi)) refs.push(m[1]);
+  // Quoted or bare: `<link rel=stylesheet href=base.css>` is a stylesheet
+  // too, and missing it showed Mike a review's pages unstyled (19 Nov).
+  for (const m of text.matchAll(/\b(?:src|href|poster|data)\s*=\s*(?:["']([^"']+)["']|([^\s"'<>=`]+))/gi)) refs.push(m[1] ?? m[2]);
   // Loops, not push(...): a page of millions of names overflowed the stack.
-  for (const m of text.matchAll(/\bsrcset\s*=\s*["']([^"']+)["']/gi)) for (const s of m[1].split(',')) refs.push(s.trim().split(/\s+/)[0]);
+  for (const m of text.matchAll(/\bsrcset\s*=\s*(?:["']([^"']+)["']|([^\s"'<>=`]+))/gi)) for (const s of (m[1] ?? m[2]).split(',')) refs.push(s.trim().split(/\s+/)[0]);
   // `url(...)` and a query or hash cut off are read in one pass each
   // (linear-text.ts): as regexes, a page of `url(` and spaces, or a name
   // of `?` after `?`, took time in the square of its length, on the
@@ -128,14 +143,15 @@ function inside(file: string, root: string): boolean {
   return !!rel && !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
-// A still of the video or page, copied in as a picture. Quick Look on a
-// Mac (a frame of a video, the top of a page); ffmpeg for a video
-// elsewhere; a plain dark card when neither can, so the review still opens.
-function stillOf(dir: string, file: string, kind: 'video' | 'page'): ImageRef {
+// A still of the video, sound or page, copied in as a picture. Quick Look
+// on a Mac (a frame of a video, the top of a page); ffmpeg for a video
+// elsewhere, and for a sound its waveform (Quick Look's is a music note);
+// a plain dark card when none can, so the review still opens.
+function stillOf(dir: string, file: string, kind: ReviewMediaKind): ImageRef {
   fs.mkdirSync(dir, { recursive: true });
   const tmp = fs.mkdtempSync(path.join(dir, '.still-'));
   try {
-    const made = (MAC ? stills.quickLook(file, tmp) : undefined) ?? (kind === 'video' ? stills.ffmpegFrame(file, tmp) : undefined);
+    const made = kind === 'audio' ? stills.ffmpegWaveform(file, tmp) : (MAC ? stills.quickLook(file, tmp) : undefined) ?? (kind === 'video' ? stills.ffmpegFrame(file, tmp) : undefined);
     if (made) return copyImageInto(dir, made);
     const card = path.join(tmp, 'card.png');
     fs.writeFileSync(card, solidPng(16, 9, [24, 24, 27]));
@@ -146,7 +162,7 @@ function stillOf(dir: string, file: string, kind: 'video' | 'page'): ImageRef {
 }
 
 // The makers of stills, an object so a test can stand in for them.
-export const stills = { quickLook, ffmpegFrame };
+export const stills = { quickLook, ffmpegFrame, ffmpegWaveform };
 
 function quickLook(file: string, out: string): string | undefined {
   try {
@@ -172,6 +188,18 @@ function ffmpegFrame(file: string, out: string): string | undefined {
     if (readImageInfo(made)?.width) return made;
   }
   return undefined;
+}
+
+// A sound's waveform, light on the dark of the card, at a still's size.
+function ffmpegWaveform(file: string, out: string): string | undefined {
+  const made = path.join(out, 'wave.png');
+  const graph = `[0:a:0]aformat=channel_layouts=mono,showwavespic=s=${STILL_PX - 160}x620:colors=0xd4d4d8:scale=sqrt[w];color=c=0x18181b:s=${STILL_PX}x900[bg];[bg][w]overlay=80:140:format=auto`;
+  try {
+    execFileSync('ffmpeg', ['-v', 'error', '-y', '-i', file, '-filter_complex', graph, '-frames:v', '1', made], { stdio: 'ignore', timeout: 30_000 });
+  } catch {
+    return undefined;
+  }
+  return readImageInfo(made)?.width ? made : undefined;
 }
 
 // A PNG of one colour, for the card in place of a still.

@@ -296,6 +296,25 @@ test('runner notifications cannot keep a stop out of an active turn', () => {
   assert.equal(s.sent.at(-1)!.text, 'Stop now');
 });
 
+test("the runner's notes reach a running turn in the order sent, a later one never past one waiting", () => {
+  const { h, thread, turnId, s } = running();
+  // Held in the queue (as while a cold thread compacts), then a newer note.
+  h.runner.send(thread.id, 'CI failed again', [], { origin: 'runner', wakeReason: "Main's CI failed again", queue: true });
+  assert.notEqual(h.runner.send(thread.id, 'CI passed again', [], { origin: 'runner', wakeReason: "Main's CI passed again" }).turnId, turnId);
+  assert.ok(!s.sent.some((m) => m.text === 'CI passed again'), 'not steered past the one waiting');
+  assert.deepEqual(h.runner.mustGet(thread.id).rec.queue.map((q) => q.text), ['CI failed again', 'CI passed again']);
+});
+
+test("the runner's note doesn't steer into a turn past a message of Mike's a Stop left unread", () => {
+  const { h, thread, turnId, s } = running();
+  const st = h.runner.mustGet(thread.id);
+  // A turn another thread's message started, with his stop still saved.
+  st.rec.interruptedMessages = [1];
+  assert.notEqual(h.runner.send(thread.id, 'CI passed again', [], { origin: 'runner', wakeReason: "Main's CI passed again" }).turnId, turnId);
+  assert.ok(!s.sent.some((m) => m.text === 'CI passed again'));
+  assert.deepEqual(st.rec.queue.map((q) => q.text), ['CI passed again']);
+});
+
 test('a fenced command in the reminder body does not turn an empty check failure into consumed output', () => {
   const { h, thread } = running();
   const out = checkOutcome({ ok: false, output: '', why: 'timeout' });
@@ -499,13 +518,126 @@ for (const mode of ['archive', 'snooze', 'waitFor'] as const) test(`an ordinary 
   assert.equal(st.rec.queue.length, 1);
 });
 
-test('a runner notification alone cannot enable archive from a background-opened turn', () => {
+// 23 Nov 2026, df5c7153: a background landing finished, the CLI opened a turn
+// to report it, and its end_turn asked to archive. The runner dropped that
+// without a word, so the thread said "I'm archiving this thread" and stayed.
+for (const mode of ['archive', 'snooze', 'waitFor'] as const) test(`a turn a finished background job opened can ${mode} its thread`, () => {
+  const { h, thread, s } = running();
+  s.result();
+  s.out({ kind: 'cliTurn', note: 'Background command "Land the fix" completed (exit code 0)' });
+  const st = h.runner.mustGet(thread.id);
+  assert.ok(st.rt.turn?.auto);
+  const input = mode === 'archive' ? { archive: true } : mode === 'snooze' ? { snooze: '1d' } : { waitFor: [h.runner.create({ text: 'Unfinished helper', accountId: 'claude-3' }).thread.id] };
+  s.out({ kind: 'event', event: { type: 'tool.call', itemId: 'park', name: 'mcp__threadbear__end_turn', kind: 'mcp', title: 'end_turn', input: { needs: 'nothing', ...input } } });
+  s.out({ kind: 'result', result: { outcome: 'completed', durationMs: 5, own: true } });
+  assert.equal(st.rt.turn, undefined);
+  if (mode === 'archive') assert.ok(st.rec.archivedAt);
+  else assert.ok(st.rec.snoozedUntil);
+});
+
+test("a background-opened turn does not archive past a message of Mike's an interrupt left unread", () => {
+  const { h, thread, s } = running();
+  s.result();
+  const st = h.runner.mustGet(thread.id);
+  st.rec.interruptedMessages = [st.rec.lastSeq];
+  s.out({ kind: 'cliTurn', note: 'Background command "Land the fix" completed (exit code 0)' });
+  s.out({ kind: 'event', event: { type: 'tool.call', itemId: 'park', name: 'mcp__threadbear__end_turn', kind: 'mcp', title: 'end_turn', input: { needs: 'nothing', archive: true } } });
+  s.out({ kind: 'result', result: { outcome: 'completed', durationMs: 5, own: true } });
+  assert.equal(st.rec.archivedAt, undefined);
+  assert.equal(st.rec.snoozedUntil, undefined);
+});
+
+test('a background-opened turn with a newer message queued still does not archive', () => {
   const { h, thread, s } = running();
   s.result();
   s.out({ kind: 'cliTurn' });
-  h.runner.send(thread.id, 'Automatic notification', [], { origin: 'runner' });
   const st = h.runner.mustGet(thread.id);
+  st.rec.queue.push({ turnId: 'later', text: 'One more thing', images: [] });
   s.out({ kind: 'event', event: { type: 'tool.call', itemId: 'park', name: 'mcp__threadbear__end_turn', kind: 'mcp', title: 'end_turn', input: { needs: 'nothing', archive: true } } });
-  s.result('completed', undefined, undefined, { answered: [...st.rt.turn!.messages] });
+  s.out({ kind: 'result', result: { outcome: 'completed', durationMs: 5, own: true } });
   assert.equal(st.rec.archivedAt, undefined);
+});
+
+// ae88bd2c, 20 Nov: a */5 schedule's check kept printing the same line
+// while the thread was busy in a long turn, and the thread deleted the
+// schedule in that turn. Each tick's copy still arrived afterwards, one
+// turn each.
+const sameReport = () => {
+  const out = checkOutcome({ ok: true, output: 'GitHub run 44525978424 finished: completed failure' });
+  assert.ok('extra' in out);
+  return `[Scheduled: "Land slice 1"]\n\nLand it${out.extra}`;
+};
+
+test('a deleted schedule\'s messages queued behind a busy turn never arrive', async () => {
+  const { h, thread, s } = running();
+  const sched = new Scheduler({ runner: h.runner, home: h.home, clock: h.clock, log: nullLogger });
+  sched.start();
+  try {
+    const sc = await sched.create({ threadId: thread.id, text: 'Land it', cron: '*/5 * * * *' });
+    const other = h.runner.sendScheduled(thread.id, 'Another schedule', 'other', 'slot-1');
+    for (const run of ['t1', 't2', 't3']) h.runner.sendScheduled(thread.id, sameReport(), sc.id, run, h.clock.now(), true);
+    await sched.delete(sc.id);
+    assert.deepEqual(h.runner.mustGet(thread.id).rec.queue.map(q => q.turnId), [other.turnId]);
+    assert.ok(h.events(thread.id).some(e => e.type === 'system.note' && /schedule was deleted/.test(e.text)));
+    // A retry of a dropped slot (an old runner, a lost reply) is answered, not queued again.
+    h.runner.sendScheduled(thread.id, sameReport(), sc.id, 't2', 0, true);
+    assert.equal(h.runner.mustGet(thread.id).rec.queue.length, 1);
+    s.result();
+    await tick(8);
+    assert.deepEqual(s.sent.slice(1).map(m => m.text), ['Another schedule']);
+  } finally { sched.stop(); }
+});
+
+test('the same check report queued on every tick arrives once', () => {
+  const { h, thread, s } = running();
+  for (const run of ['t1', 't2', 't3']) h.runner.sendScheduled(thread.id, sameReport(), 's1', run, h.clock.now(), true);
+  const changed = checkOutcome({ ok: true, output: 'Something new' });
+  assert.ok('extra' in changed);
+  h.runner.sendScheduled(thread.id, `Land it${changed.extra}`, 's1', 't4', h.clock.now(), true);
+  const q = h.runner.mustGet(thread.id).rec.queue;
+  assert.equal(q.length, 2);
+  assert.match(q[0].text, /44525978424/);
+  assert.match(q[1].text, /Something new/);
+  s.result();
+  assert.equal(s.sent.filter(m => /44525978424/.test(m.text)).length, 1);
+});
+
+test('a deleted schedule\'s message whose receipt cannot be written stays queued', () => {
+  const { h, thread, s } = running();
+  const a = h.runner.sendScheduled(thread.id, sameReport(), 's1', 't1', h.clock.now(), true);
+  const b = h.runner.sendScheduled(thread.id, `${sameReport()}\nmore`, 's1', 't2', h.clock.now(), true);
+  const emit = h.runner.emit.bind(h.runner);
+  let notes = 0;
+  h.runner.emit = ((st, body, turnId) => {
+    if (body.type === 'system.note' && ++notes === 2) throw new Error('ENOSPC');
+    return emit(st, body, turnId);
+  }) as typeof h.runner.emit;
+  assert.throws(() => h.runner.dropScheduled(thread.id, 's1'), /ENOSPC/);
+  assert.deepEqual(h.runner.mustGet(thread.id).rec.queue.map(q => q.turnId), [b.turnId]);
+  assert.notEqual(a.turnId, b.turnId);
+  // Once the disk has room, it's dropped before the next turn would start,
+  // with no scheduler to ask (a draining runner's has stopped).
+  h.runner.emit = emit;
+  const turns = s.sent.length;
+  s.result();
+  assert.equal(s.sent.length, turns);
+  assert.equal(h.runner.mustGet(thread.id).rec.queue.length, 0);
+});
+
+test('a deleted schedule\'s reminder that comes in late (a handover, a lost reply, a failed receipt) never starts', () => {
+  const { h, thread, s } = running();
+  const gone = new Set<string>();
+  h.runner.scheduleDeleted = (id) => gone.has(id);
+  // Queued without a receipt: adopted from a draining runner, or one whose receipt failed.
+  h.runner.sendScheduled(thread.id, sameReport(), 's1', 't1', h.clock.now(), true);
+  h.runner.sendScheduled(thread.id, 'Another schedule', 'other', 't1');
+  gone.add('s1');
+  s.result();
+  assert.deepEqual(s.sent.slice(1).map(m => m.text), ['Another schedule']);
+  assert.ok(h.events(thread.id).some(e => e.type === 'system.note' && /schedule was deleted/.test(e.text)));
+  s.result();
+  // And on an idle thread, a send for it is answered without a turn.
+  const turns = s.sent.length;
+  h.runner.sendScheduled(thread.id, sameReport(), 's1', 't9', h.clock.now(), true);
+  assert.equal(s.sent.length, turns);
 });

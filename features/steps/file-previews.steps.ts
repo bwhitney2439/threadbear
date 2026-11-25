@@ -107,6 +107,19 @@ Then('the pane shows a video {int} by {int}', async function (this: ThreadbearWo
   await this.until(`a ${width}x${height} video in the pane`, (d) => pane(d)?.previewKind === 'video' && pane(d)?.previewText === `${width}x${height}`);
 });
 
+// The GPUI app says "audio" for a sound file in the pane's player.
+Then('the pane shows a sound player', async function (this: ThreadbearWorld) {
+  await this.until('a sound player in the pane', (d) => pane(d)?.previewKind === 'audio');
+});
+
+When('I press play on the sound in the pane', async function (this: ThreadbearWorld) {
+  await this.app.do({ cmd: 'preview', play: true });
+});
+
+Then('the sound in the pane is playing', async function (this: ThreadbearWorld) {
+  await this.until('the sound playing', (d) => (pane(d) as { previewVideo?: { playing?: boolean } } | undefined)?.previewVideo?.playing === true);
+});
+
 // The Swift app says "quickLook" for whatever Quick Look draws, so it's that
 // there; the GPUI app's PDFKit view says "pdf" and its pages.
 Then('the pane shows the PDF', async function (this: ThreadbearWorld) {
@@ -177,4 +190,13 @@ Then('the local page in the pane is titled {string}', { timeout: 120_000 }, asyn
 When('I press Run them over the page in the pane', async function (this: ThreadbearWorld) {
   await this.until('the bar asking to run its scripts', (d) => pane(d)?.previewNote === 'This page has scripts');
   await this.app.do({ cmd: 'preview', runScripts: true });
+});
+
+// A note in place of the file (one that only opens in its app, or one waiting
+// for the runner), as against the bar over a file (`the pane says`). On
+// Windows the app reads this Mac's own files itself, not through the runner
+// (desktop/gpui/src/main.rs `call`), so nothing waits there.
+Then('the pane\'s note reads {string} on a Mac or Linux', async function (this: ThreadbearWorld, words: string) {
+  if (process.platform === 'win32') return;
+  await this.until(`the pane's note to read "${words}"`, (d) => pane(d)?.previewKind === 'note' && pane(d)?.previewText === words);
 });

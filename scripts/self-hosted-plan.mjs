@@ -96,10 +96,11 @@ export function ownAddress(raw, flag) {
 //   adminKeyFile  secrets/convex-self-hosted.env is here
 //   syncUrl, syncSite  runner.json's sync.url and sync.site, if any
 //
-// Returns { selfHosted: false } or { selfHosted: true, mode, from?, url?,
-// site?, readdressed? } (from: the mode it had, when this moves it; url and
-// site: the addresses, for mode "url"; readdressed: still "url", at new
-// addresses), or { fail } with why.
+// Returns { selfHosted: false } or { selfHosted: true, mode, from?, was?,
+// url?, site?, readdressed? } (from: the mode it had, when this moves it;
+// was: the old { url, site } when that was "url"; url and site: the
+// addresses, for mode "url"; readdressed: still "url", at new addresses),
+// or { fail } with why.
 export function selfHostedPlan({ flags = {}, joining = false, adminKeyFile = false, syncUrl, syncSite }) {
   const { local = false, tailnet = false } = flags;
   const own = flags.url !== undefined || flags.siteUrl !== undefined;
@@ -142,7 +143,12 @@ export function selfHostedPlan({ flags = {}, joining = false, adminKeyFile = fal
     if (!syncSite) return { fail: 'This Mac\'s backend is at an address of your own, but runner.json has no sync.site saying where its website is. Run setup again with --url and --site-url.' };
     addr = { url: syncUrl, site: syncSite };
   }
-  const moved = had && had !== mode ? { from: had } : {};
+  // Off an address of your own: setup can't take your proxy down, so it
+  // keeps the old addresses to check they no longer reach this backend
+  // (oldAddressStep; Daybreak 150, 17 Nov 2026). Setup adds the ones on
+  // record (OWN_ADDRESSES_FILE).
+  const was = had === 'url' && mode !== 'url' ? { was: { url: syncUrl, ...(syncSite ? { site: syncSite } : {}) } } : {};
+  const moved = had && had !== mode ? { from: had, ...was } : {};
   const readdressed = had === 'url' && mode === 'url' && (addr.url !== syncUrl || addr.site !== syncSite) ? { readdressed: true } : {};
   return { selfHosted: true, mode, ...moved, ...(addr ? addr : {}), ...readdressed };
 }
@@ -298,4 +304,96 @@ export function tailnetPendingFiles(defaultHome, home, path) {
   const legacy = path.join(home, TAILNET_PENDING_FILE);
   if (path.resolve(legacy) !== path.resolve(files[0])) files.push(legacy);
   return files;
+}
+
+// A move off an address of your own (--url) to this Mac only or the tailnet.
+// Both ways publish the backend on the same loopback ports (13210, 13211)
+// and keep its data, so the proxy you pointed at them goes on forwarding:
+// share links, and phones paired at that address, still reach it, whatever
+// setup then says about where it can be reached. Setup can't take your proxy
+// down, so it checks each old address from this Mac against the backend's
+// own answer on loopback, before anything changes and again after:
+//   { do: 'fail', message }  one still reaches it; stops, with the old
+//                            addresses still on record, so the next run
+//                            checks again
+//   { do: 'ok', message }    none does (one that doesn't answer at all
+//                            counts, or a Mac whose old name is gone could
+//                            never move), said plainly as only this Mac's
+//                            view, which can't prove the proxy is gone
+// `checks` is [{ addr, want, got }], each { status, body } or { error } as
+// setup's `get` gives them, several per address (Daybreak 150, 17 Nov 2026).
+export function oldAddressStep({ checks, mode, again }) {
+  const same = (a, b) => !a.error && !b.error && a.status === b.status && a.body === b.body;
+  const still = [...new Set(checks.filter(({ want, got }) => same(want, got)).map((c) => c.addr))];
+  const where = mode === 'local' ? 'this Mac only' : 'your tailnet only';
+  const addrs = (list) => list.join(' and ');
+  if (still.length) {
+    return { do: 'fail', message: `${addrs(still)} still ${still.length > 1 ? 'reach' : 'reaches'} this backend through your own proxy, so it wouldn't be on ${where}: anyone with a share link, and any phone paired at that address, could still use it. Setup can't take your proxy down for you. Remove the rules that forward ${addrs(still)} to 127.0.0.1:${PORTS.api[1]} and 127.0.0.1:${PORTS.site[1]} (or stop the proxy), check curl ${still[0]}/version no longer prints the backend's version, then run ${again}` };
+  }
+  const all = [...new Set(checks.map((c) => c.addr))];
+  return { do: 'ok', message: `${addrs(all)} didn't reach this backend when setup asked from this Mac, but that's all setup can see: it can't tell whether your proxy still forwards ${all.length > 1 ? 'them' : 'it'} for others. Until you've removed your proxy's rules for ${all.length > 1 ? 'them' : 'it'} (to 127.0.0.1:${PORTS.api[1]} and :${PORTS.site[1]}), share links and phones paired there may still reach it, so it isn't on ${where} until then.` };
+}
+
+// Every address a --url setup was given, kept in the default data folder
+// whatever --home says (the containers and their ports are the Mac's, one
+// set for every data folder), written before the containers change. A move
+// off checks them all, not only the ones this --home's runner.json names, so
+// a --url setup that stopped before saving runner.json, a later readdress,
+// or a run for another --home still checks (Codex's review of Daybreak 150).
+// Never removed by setup: from this Mac it can't prove a proxy is gone, so
+// every later run off your address asks again and says so. You delete it
+// once those addresses are gone for good.
+export const OWN_ADDRESSES_FILE = 'self-hosted-own-addresses.json';
+
+// { api: [...], site: [...] } from the file's text and more addresses to add;
+// anything that isn't a list of strings in it is dropped.
+export function ownAddresses(text, add = {}) {
+  let was = {};
+  try {
+    was = JSON.parse(text ?? '{}') ?? {};
+  } catch {
+    was = {};
+  }
+  const list = (k) => [...new Set([...(Array.isArray(was[k]) ? was[k] : []), ...(add[k] ?? [])].filter((x) => typeof x === 'string' && x))];
+  return { api: list('api'), site: list('site') };
+}
+
+// The backend and dashboard images, pinned by manifest digest, never a tag:
+// a tag (even one that reads like a commit) is a registry mapping anyone
+// who can publish to it can move, and the backend holds the mirror's data
+// and makes its admin key (Daybreak 172, 23 Nov 2026). Docker checks the
+// bytes it pulls against the digest, and pinnedImage below checks again.
+//
+// Both are Convex's build of upstream commit CONVEX_IMAGE_COMMIT (the tag
+// they're published under). An upgrade can need an export and an import
+// (Convex's self-hosted/advanced/upgrading.md), so move them on
+// deliberately, both together: pick the new commit's tag, read each
+// image's index digest (`docker buildx imagetools inspect
+// ghcr.io/convex/convex-backend:<commit>`, the "Digest:" line), and change
+// all three lines here in one commit. Setup then makes the containers again
+// on the same volume.
+export const CONVEX_IMAGE_COMMIT = 'd1fcbeaf939502a23a0f4b7e9095a12e84866294';
+export const BACKEND_IMAGE = 'ghcr.io/convex/convex-backend@sha256:e9c084e8bd6c1f249012c672193f0988c748824f55a24cdad45f6185a8462f9a';
+export const DASHBOARD_IMAGE = 'ghcr.io/convex/convex-dashboard@sha256:caf95d3f2241cddc103a84b728294fa0777c6acc291a2c4612c1d06faaa1c43a';
+
+const PINNED = /^[a-z0-9.-]+(?::\d+)?\/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$/;
+
+// Has this image, by exactly that digest, pulling it if not; throws if the
+// reference isn't a digest or what Docker has under it doesn't carry it.
+// `docker` runs the docker CLI ({ status, stdout }), a stub in the test.
+export function pinnedImage(docker, ref) {
+  if (!PINNED.test(ref)) throw new Error(`${ref} isn't pinned by digest (name@sha256:<64 hex>), so setup won't run it.`);
+  if (docker(['image', 'inspect', ref]).status !== 0) {
+    if (docker(['pull', '-q', ref], { stdio: ['ignore', 'ignore', 'inherit'] }).status !== 0) throw new Error(`docker pull ${ref} failed.`);
+  }
+  const got = docker(['image', 'inspect', '--format', '{{json .RepoDigests}}', ref]);
+  let digests = [];
+  try {
+    digests = JSON.parse(got.stdout || '[]');
+  } catch {
+    digests = [];
+  }
+  if (got.status !== 0 || !Array.isArray(digests) || !digests.includes(ref)) {
+    throw new Error(`The image Docker has for ${ref} doesn't carry that digest (it has ${Array.isArray(digests) && digests.length ? digests.join(', ') : 'none'}), so setup won't run it. Remove it (docker image rm ${ref}) and run setup again.`);
+  }
 }

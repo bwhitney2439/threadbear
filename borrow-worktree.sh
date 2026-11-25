@@ -15,11 +15,41 @@
 #                                     once everything in it is on main: back
 #                                     in the pool for the next thread, and its
 #                                     borrow branch deleted
+#   ./borrow-worktree.sh --help       this list, borrowing nothing
+#
+# Anything else is refused, borrowing nothing: on 23 Nov `--help`, which
+# it didn't know then, borrowed a slot.
+#
+# A borrow nobody gives back is taken back by the runner once it's safe
+# (runner/src/borrows.ts): clean, everything on main, nothing running in
+# it, and its borrower gone (the thread archived, the script that took it
+# ended) or, with none recorded, unused for a day. On 17 Nov 25 slots sat
+# on borrow branches never given back, all 50 were taken, and sync-main
+# couldn't borrow one. So the borrower is written beside git's own files:
+# the thread (THREADBEAR_THREAD_ID) and its runner's data dir and, for a script that gives it back
+# itself, its process (THREADBEAR_BORROW_PID), and whether what's in it is
+# scratch the runner may throw away once that process has gone
+# (THREADBEAR_BORROW_SCRATCH=1; sync-main's is).
 #
 # Taking a spare is a rename of git's lock file, the same as the runner's
 # (claimSpare in runner/src/worktrees.ts), so only one of two at once wins
 # and a thread and the runner never take the same one.
+#
+# Never one an open thread works in (runner/src/lived-in.ts): a thread that
+# borrowed a slot and moved itself there stays in it after giving it back,
+# and on 23 Nov the Canvas thread's next turn committed on the branch of the
+# borrower slot-32 went to next.
 set -euo pipefail
+
+# The usage lines above, from the first `./borrow-worktree.sh` to the `#` after them.
+usage() { sed -n '/^#   \.\/borrow-worktree\.sh/,/^#$/{/^#$/d;s/^# //;p;}' "${BASH_SOURCE[0]}"; }
+refuse() { echo "borrow-worktree.sh: $1" >&2; usage >&2; exit 2; }
+case "${1:-}" in
+  -h | --help) usage; exit 0 ;;
+  --give-back) [ $# -le 2 ] || refuse "--give-back takes one folder" ;;
+  "") [ $# -eq 0 ] || refuse "an empty argument" ;;
+  *) refuse "unknown argument: $1" ;;
+esac
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAIN="$(git -C "$ROOT" worktree list --porcelain | awk '
@@ -51,13 +81,22 @@ if [ "${1:-}" = "--give-back" ]; then
     thread/borrow-*|"") ;;
     *) echo "$dir is on $current, not a borrowed branch: it's someone else's now, so it wasn't given back." >&2; exit 1 ;;
   esac
+  # Landed means on main, or on it by patch: a group check in `tb land`
+  # rebases the branch again before main moves, so what's on main can be the
+  # same changes under new ids (17 Nov, slot-32). `git cherry` marks each
+  # commit of HEAD's that main has no equal of with "+".
   if ! git -C "$dir" merge-base --is-ancestor HEAD main; then
-    echo "$dir has commits that aren't on main; land them first." >&2
-    exit 1
+    unlanded="$(git -C "$dir" cherry main HEAD)" || { echo "Couldn't compare $dir with main." >&2; exit 1; }
+    if printf '%s\n' "$unlanded" | grep -q '^+'; then
+      echo "$dir has commits that aren't on main; land them first." >&2
+      exit 1
+    fi
   fi
   branch="$(git -C "$dir" symbolic-ref -q --short HEAD || true)"
   git -C "$dir" checkout -q --detach
-  # Only the branch this script made; it's all on main (checked above).
+  rm -f "$(git -C "$dir" rev-parse --absolute-git-dir)/threadbear-borrow"
+  # Only the branch this script made; it's all on main, or on it by patch
+  # (checked above).
   case "$branch" in thread/borrow-*) git -C "$MAIN" branch -q -D "$branch" ;; esac
   git -C "$MAIN" worktree lock --reason "$SPARE" "$dir"
   echo "$dir is a spare again."
@@ -69,14 +108,40 @@ fi
 # it from meeting a branch an earlier borrow never gave back.
 borrow_branch() { echo "thread/borrow-$(basename "$1")-$(date +%Y%m%d-%H%M%S)"; }
 
+# The slots an open thread works in. When they can't be read, no spare is
+# taken: a new slot is slow to build but nobody's.
+if lived="$(node "$ROOT/runner/src/lived-in.ts" "$THREADS" 2>/dev/null)"; then
+  spares="$(git -C "$MAIN" worktree list --porcelain | awk -v RS= -v d="$THREADS/" '
+    /\nlocked threadbear spare/ { sub(/^worktree /, ""); sub(/\n.*/, ""); if (index($0, d) == 1) print }')"
+else
+  echo "Couldn't read which slots threads work in, so a new slot is made rather than a spare taken." >&2
+  lived=""
+  spares=""
+fi
+lived_in() { [ -n "$lived" ] && printf '%s\n' "$lived" | grep -qxF "$1"; }
+
 claimed=""
-for dir in $(git -C "$MAIN" worktree list --porcelain | awk -v RS= -v d="$THREADS/" '
-  /\nlocked threadbear spare/ { sub(/^worktree /, ""); sub(/\n.*/, ""); if (index($0, d) == 1) print }'); do
+for dir in $spares; do
+  if lived_in "$dir"; then
+    echo "Passed over $dir: an open thread works in it." >&2
+    continue
+  fi
   # One that can't be read is skipped, as the runner does.
   admin="$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null)" || continue
   lock="$admin/locked"
+  # The renamed file stays, touched first, until it's set up below: the runner's
+  # borrow sweep counts it as the folder in use, so it doesn't take the
+  # detached, unlocked folder back meanwhile (runner/src/borrows.ts).
+  touch -c "$lock" 2>/dev/null || true
   if mv "$lock" "$lock.claimed-$$" 2>/dev/null; then
-    rm -f "$lock.claimed-$$"
+    claim="$lock.claimed-$$"
+    # Not one with changes to tracked files: a spare never has them, so
+    # someone is working there, and the reset below would take their work
+    # (21 Nov). It stays unlocked, out of the pool, as the runner leaves one.
+    if [ -n "$(git -C "$dir" status --porcelain --untracked-files=no 2>/dev/null || echo unreadable)" ]; then
+      echo "Passed over $dir: it has changes to tracked files, so someone is working there." >&2
+      continue
+    fi
     claimed="$dir"
     break
   fi
@@ -86,14 +151,36 @@ if [ -n "$claimed" ]; then
   git -C "$claimed" reset -q --hard
   git -C "$claimed" clean -ffdxq "${KEEP[@]}"
   git -C "$claimed" checkout -q -b "$(borrow_branch "$claimed")" main
+  rm -f "$claim"
 else
   mkdir -p "$THREADS"
+  # The first free slot number. No cap on the number: on 17 Nov a cap of 50
+  # was reached with every slot taken, and the borrow failed. A failed add
+  # (another borrower took that number first) tries the next, a few times.
+  # Paths git still has registered count as taken even with their folder
+  # gone: git refuses to add one there. So does one an open thread's record
+  # still names, its folder gone.
+  registered="$(git -C "$MAIN" worktree list --porcelain | sed -n 's/^worktree //p')"
   n=1
-  until claimed="$THREADS/slot-$n"; [ ! -e "$claimed" ] && git -C "$MAIN" worktree add -q -b "$(borrow_branch "$claimed")" "$claimed" main 2>/dev/null; do
+  tries=0
+  while :; do
+    claimed="$THREADS/slot-$n"
+    if [ ! -e "$claimed" ] && ! printf '%s\n' "$registered" | grep -qxF "$claimed" && ! lived_in "$claimed"; then
+      err="$(git -C "$MAIN" worktree add -q -b "$(borrow_branch "$claimed")" "$claimed" main 2>&1)" && break
+      tries=$((tries + 1))
+      [ "$tries" -lt 5 ] || { echo "Couldn't make a worktree in $THREADS: $err" >&2; exit 1; }
+    fi
     n=$((n + 1))
-    [ "$n" -le 50 ] || { echo "Couldn't make a worktree in $THREADS." >&2; exit 1; }
   done
 fi
+{
+  echo "thread=${THREADBEAR_THREAD_ID:-}"
+  echo "home=${THREADBEAR_RUNNER_HOME:-}"
+  echo "branch=$(git -C "$claimed" symbolic-ref -q --short HEAD)"
+  echo "pid=${THREADBEAR_BORROW_PID:-}"
+  echo "scratch=${THREADBEAR_BORROW_SCRATCH:-}"
+  echo "at=$(date +%s)"
+} >"$(git -C "$claimed" rev-parse --absolute-git-dir)/threadbear-borrow"
 
 "$claimed/worktree-setup.sh" >&2
 echo "$claimed"

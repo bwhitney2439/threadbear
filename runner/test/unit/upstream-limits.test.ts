@@ -7,9 +7,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { tmpDir } from '../helpers/fakes.ts';
 import { FakeClock } from '../../src/clock.ts';
-import { type GitOptions, MAC_SK_PROVIDER, TOUCH_SIGN_TIMEOUT_MS, touchKey, gitAsync, SETTLE_MS, signersPath } from '../../src/upstream.ts';
+import { type GitOptions, MAC_SK_PROVIDER, TOUCH_SIGN_TIMEOUT_MS, touchKey, gitAsync, gitBytes, SETTLE_MS, signersPath } from '../../src/upstream.ts';
 import { ADD_DELAY_MS, keyStatePath, revokedPath } from '../../src/release-keys.ts';
-import { LATER, alive, commit, git, kept, key, keyLine, objectsIn, pinnedKeys, pubOf, release, signedTag, upstreamFor, world } from '../helpers/upstream-harness.ts';
+import { alive, commit, git, hangAlias, key, keyLine, LATER, objectsIn, pinnedKeys, pubOf, release, signedTag, startedPid, upstreamFor, world } from '../helpers/upstream-harness.ts';
 
 test('a fetch bigger than the limit is stopped, and brings nothing into the checkout', async () => {
   const w = world();
@@ -69,11 +69,11 @@ test("gitAsync's watcher stops a command it says is over its limit, and what it 
   const pidFile = path.join(dir, 'pid');
   let asked = 0;
   await assert.rejects(
-    gitAsync(dir, ['-c', `alias.hang=!sleep 600 & echo $! >${pidFile}; wait`, 'hang'], { timeoutMs: 60_000, over: () => (++asked >= 2 ? 'fetched more than 1 MB' : undefined) }),
+    gitAsync(dir, ['-c', hangAlias(dir, pidFile), 'hang'], { timeoutMs: 60_000, over: () => (++asked >= 2 ? 'fetched more than 1 MB' : undefined) }),
     /fetched more than 1 MB/,
   );
   await new Promise((r) => setTimeout(r, 200));
-  assert.ok(!alive(Number(fs.readFileSync(pidFile, 'utf8'))));
+  assert.ok(!alive(startedPid(pidFile)));
 });
 
 // Security review finding 3 (c), 9 Nov 2026: a key used to sign a tag on a
@@ -261,15 +261,16 @@ test('a key another runner revokes during a check stops that check offering its 
   const offered: (string | undefined)[] = [];
   const up = upstreamFor(w.theirs, w.home, new FakeClock(LATER), {
     onChecked: (st: { release?: { tag: string } }) => offered.push(st.release?.tag),
-    git: async (cwd: string, args: string[], opts?: GitOptions) => {
-      // As this check reads the release's key files, the other runner
-      // revokes `next` (it holds a newer release that does).
-      if (!done && args[0] === 'show' && String(args[1]).endsWith(':scripts/release-signers')) {
+    gitBytes: async (cwd: string, args: string[]) => {
+      // As this check reads the release's key files (object by object, from
+      // its commit), the other runner revokes `next` (it holds a newer
+      // release that does).
+      if (!done && args[0] === 'cat-file' && args[1] === 'commit') {
         done = true;
         fs.writeFileSync(signersPath(w.home), `${keyLine(w.mikeKey)}\n`);
         fs.writeFileSync(path.join(w.home, 'upstream-revoked'), `${pubOf(next)}\n`);
       }
-      return gitAsync(cwd, args, opts);
+      return gitBytes(cwd, args);
     },
   });
   const s = await up.check();

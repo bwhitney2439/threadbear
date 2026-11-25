@@ -210,6 +210,28 @@ that, saying to use `--tailnet`), and anything else is your own address
 (`reachOf` in `scripts/self-hosted-plan.mjs`). A paired phone needs pairing
 again after any move.
 
+**Moving off your own address.** Setup can't take your proxy down, and the
+local and tailnet ways use the same loopback ports (13210 and 13211), so a
+proxy left up goes on forwarding your old addresses to the backend: share
+links and phones paired there would still reach it. So before `--local` or
+`--tailnet`, take down your proxy's rules for both addresses (or stop the
+proxy). Every address a `--url` setup is given is kept in
+`self-hosted-own-addresses.json` in the default data folder, written before
+the containers change, so a `--url` run that stopped partway, an earlier
+address or a run for another `--home` is still checked. A move off asks each
+of them from this Mac (the API's `/version` and a path nothing serves, the
+website's path nothing serves) and compares the answer with the backend's own
+on loopback, before anything changes and again after the move, before
+runner.json gets the new address. If one still answers as the backend does,
+setup stops, naming it, and the next run checks again. `curl https://<your
+address>/version` printing the backend's version means it's still forwarded.
+An address that doesn't answer counts as gone (or a Mac whose old name is gone
+could never move), but setup can only see from this Mac, so it says so at the
+end, on that run and every later one: it's only on this Mac or your tailnet
+once your proxy's rules for those addresses are gone. When they are for good,
+delete `self-hosted-own-addresses.json` and setup stops asking
+(`oldAddressStep`, Daybreak 150, 17 Nov 2026).
+
 ## What setup makes
 
 `scripts/setup.mjs`, "a self-hosted backend":
@@ -285,9 +307,31 @@ Everything is in the `threadbear-convex-data` volume. To back it up, export
 with the Convex CLI using the admin key (`npx convex export`, with the
 variables from `secrets/convex-self-hosted.env` set).
 
-The image tag is pinned because an upgrade can need an export and an import
-(Convex's `self-hosted/advanced/upgrading.md`). Move `CONVEX_IMAGE_TAG` on
-deliberately; setup then makes the containers again on the same volume.
+Upgrading Threadbear itself needs nothing by hand: your main Mac's runner
+deploys the backend from each release it brings in. When a release changes
+the schema in a way the rows already stored have to be got ready for (a
+field becoming required, listed in `convex/migrations.json`), the deploy
+first deploys that release with the field optional (`convex/stepping.ts`),
+runs its backfill (`migrations:run`) to the end, then deploys the release
+as it is. It only ever deploys the release it's updating to, so a copy that
+skipped releases, or a fork with schema changes of its own, upgrades the
+same way. For the minute the backfill takes, what the phone or a runner asks
+of that part of the backend is told to try again. If the backfill or the
+final deploy fails partway, the runner tries again at its next check, every
+few minutes, until it goes through. `tb logs` and
+`<home>/runner/update.log` show each step. If you deploy `convex/` by hand
+instead, do the same: `node runner/scripts/deploy-backend.mjs` does it for
+you, with the admin key in `secrets/convex-self-hosted.env`.
+
+Both images are pinned by manifest digest (`name@sha256:…`), not a tag:
+a tag, even one that reads like a commit, can be moved by whoever can
+publish to it, and the backend holds your mirror and makes its admin key.
+Setup pulls exactly that digest and stops before making a container if
+what Docker has doesn't carry it. An upgrade can need an export and an
+import (Convex's `self-hosted/advanced/upgrading.md`), so move them on
+deliberately: the comment above `BACKEND_IMAGE` in
+`scripts/self-hosted-plan.mjs` says how. Setup then makes the containers
+again on the same volume.
 
 To take it out: `docker rm -f threadbear-convex threadbear-convex-dashboard`,
 `docker volume rm threadbear-convex-data` (this deletes your threads'

@@ -50,13 +50,59 @@ export type QueueEntry = {
   // tb land --despite-red: the repair for a red main. Goes first in a
   // group check, outside the limit.
   fix?: boolean;
+  // The main on which this fix is checked like any other landing, inside
+  // the limit (ridesFree): a group check with it failed, and main by itself
+  // passes what failed, so the failure is in the landings and a fix has no
+  // claim to ride in every group. On 18 Nov most of a line of fourteen had
+  // landed with --despite-red (GitHub's desktop workflow was red all day),
+  // so two of them that failed only together were in every group, and the
+  // halving couldn't split them. Lapses once main moves, like `limit`.
+  ordinaryAt?: string;
+  // tb land pushes main to GitHub once this lands (worktrees.ts, pushMain).
+  push?: boolean;
   // The most landings it may be checked with. Each failed check of a group
   // halves it for everyone in that group, so a failure is narrowed down in a
   // few checks rather than one by one.
   limit?: number;
   limitAt?: string; // the main that limit was set on; it lapses once main moves
   result?: QueueResult;
+  // Left out of its group by the lock's holder: after the group's check
+  // failed, what failed was run on this landing by itself (on the main it
+  // would have landed on, `at`) and failed there too. `text` is what its tb
+  // prints as it stops. Out of the line from then on, like one with a result.
+  refused?: { text: string; at: string };
+  // Checked by itself from now on, never in another's group: a group's
+  // check failed with it, and the holder's next one passed without it
+  // (worktrees.ts, landLocked). It may only fail with the holder, so it
+  // isn't refused; its own tb checks it alone when its turn comes. On 17
+  // Nov one broken landing at the front of the line went into every
+  // holder's group, each halving down to it and landing only the holder,
+  // for over four hours. `why` is what its tb says when it gets there.
+  alone?: { why: string; at: number };
+  // When a holder first put it in a group check. From then on it stays in
+  // the line after its tb has gone (waiting(), isCarried), and each holder
+  // after stacks it, until a check with it passes and it lands, it's
+  // refused or set aside, or its branch no longer has what it asked to land
+  // (worktrees.ts, stillAsked). On 23 Nov two landings whose agents' time
+  // limits killed their tbs during a group check were dropped: the passing
+  // check didn't land (another's branch had moved; GitHub went red), and the
+  // next holder never saw them, as their entries went with their tbs.
+  inCheckAt?: number;
 };
+
+// How long a landing whose tb has gone is carried after its first check:
+// long enough for a day's line, not forever for one nobody comes back to.
+export const CARRY_MS = 12 * 3600_000;
+
+// A landing whose tb has gone that the holders still land: it was in a
+// check, and hasn't landed, been refused or been set aside to be checked
+// alone (only its own tb does that).
+export const isCarried = (e: QueueEntry, now = Date.now()): boolean =>
+  e.inCheckAt !== undefined && !e.result && !e.refused && !e.alone && now - e.inCheckAt < CARRY_MS;
+
+// A fix that goes first in every group check and outside the limit, on
+// this main: one not yet shown to be just another landing (ordinaryAt).
+export const ridesFree = (e: Pick<QueueEntry, 'fix' | 'ordinaryAt'>, main: string): boolean => !!e.fix && e.ordinaryAt !== main;
 
 export const queueDir = (common: string): string => path.join(common, 'threadbear-land-queue');
 const runningFile = (common: string): string => path.join(common, 'threadbear-land-running.json');
@@ -106,8 +152,9 @@ function alive(pid: number): boolean {
 }
 
 // Everyone waiting, first come first, without results yet. An entry whose
-// tb has gone (killed by an agent's time limit, say) is removed: nobody's
-// asking for it any more.
+// tb has gone (killed by an agent's time limit, say) before any check of it
+// started is removed: nobody's asking for it any more. One already in a
+// check stays (carried), for the holders to land.
 export function waiting(common: string): QueueEntry[] {
   let names: string[];
   try {
@@ -120,10 +167,11 @@ export function waiting(common: string): QueueEntry[] {
     const e = readJson<QueueEntry>(path.join(queueDir(common), n));
     if (!e || typeof e.pid !== 'number') continue;
     if (!alive(e.pid)) {
-      leaveQueue(common, e.id);
+      if (isCarried(e)) found.push(e);
+      else leaveQueue(common, e.id);
       continue;
     }
-    if (!e.result) found.push(e);
+    if (!e.result && !e.refused) found.push(e);
   }
   return found.sort((a, b) => a.at - b.at || a.id.localeCompare(b.id));
 }
@@ -193,6 +241,7 @@ export function waitingLine(common: string, timesFile: string, me: QueueEntry | 
   const ahead = me ? all.filter((e) => e.id !== me.id && (e.at < me.at || (e.at === me.at && e.id < me.id))).length : all.length;
   const typical = typicalCheckSeconds(timesFile);
   const parts: string[] = [];
+  if (me && readEntry(common, me.id)?.alone) parts.push('set aside to be checked by itself, as a group check failed with it');
   if (running) {
     const ago = Math.max(0, Math.round((now - running.startedAt) / 1000));
     if (me && checking(me)) {

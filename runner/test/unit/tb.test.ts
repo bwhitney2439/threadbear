@@ -117,6 +117,27 @@ test('inside a thread, tb will not delete, interrupt, snooze or archive that thr
   }
 });
 
+test('tb unarchive --wrong-hide brings a thread back and writes the miss down, for the quiet inbox\'s daily review', async () => {
+  const { h, server, url } = await serve();
+  try {
+    const { thread } = h.runner.create({ text: 'rename it', accountId: 'claude-3' });
+    h.adapter.last.init();
+    h.adapter.last.result();
+    h.runner.update({ threadId: thread.id, archived: true, archivedBy: 'threadbear' });
+    const t = tb(h, url, ['unarchive', thread.id.slice(0, 8), '--wrong-hide']);
+    assert.equal(await t.exited, 0, t.out());
+    assert.equal(h.runner.get(thread.id).archivedAt, undefined);
+    assert.ok(h.events(thread.id).some((e) => e.type === 'system.note' && e.text === 'Brought back by you: you should have been shown this.'));
+    // A plain unarchive says nothing of the sort.
+    const { thread: other } = h.runner.create({ text: 'other', accountId: 'claude-3' });
+    h.runner.update({ threadId: other.id, archived: true });
+    assert.equal(await tb(h, url, ['unarchive', other.id]).exited, 0);
+    assert.ok(!h.events(other.id).some((e) => e.type === 'system.note' && /should have been shown/.test(e.text)));
+  } finally {
+    await server.close();
+  }
+});
+
 test('tb finds a runner on port 0 through runner.json, as the CLIs of a dev or sandbox runner must', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'tb-port-'));
   try {
@@ -218,6 +239,40 @@ test('tb new on codex-main with a model and effort, tb accounts with and without
     assert.match(a.out(), /^\* codex-main +Codex +main@example\.com$/m);
     assert.doesNotMatch(a.out(), /Codex · /);
     assert.match(a.out(), /^ {2}claude-3 +Claude +three@example\.com {2}\(Work only\)$/m);
+  } finally {
+    await server.close();
+  }
+});
+
+test('tb accounts --json prints every login with its merged usage, for scripts checking room left', async () => {
+  const usage = {
+    windows: [{ kind: 'weekly_model' as const, title: 'Weekly Fable', remainingPercent: 38, resetsAt: '2026-11-20T09:00:00.000Z' }],
+    readAt: '2026-11-17T08:00:00.000Z',
+    source: 'shared' as const,
+    stale: true,
+    blocked: true,
+  };
+  const accounts = withCodex().map((a) => (a.id === 'claude-3' ? { ...a, note: 'Work only', usage, signedOut: true } : a));
+  const h = makeHarness(undefined, {}, { accounts: new FakeAccounts(accounts) });
+  const server = new RpcServer({ host: '127.0.0.1', port: 0, token: readToken(h.home), runner: h.runner, log: nullLogger });
+  const { port } = await server.listen();
+  const url = `ws://127.0.0.1:${port}/rpc`;
+  try {
+    const j = tb(h, url, ['accounts', '--json']);
+    assert.equal(await j.exited, 0, j.out());
+    const out = JSON.parse(j.out());
+    assert.deepEqual(out.accounts.map((a: { id: string }) => a.id), accounts.map((a) => a.id));
+    assert.equal(out.defaultAccountId, 'claude-main');
+    const three = out.accounts.find((a: { id: string }) => a.id === 'claude-3');
+    assert.equal(three.provider, 'claude');
+    assert.equal(three.title, 'three@example.com');
+    assert.equal(three.note, 'Work only');
+    assert.equal(three.signedOut, true);
+    assert.equal(three.isDefault, false);
+    assert.deepEqual(three.usage, usage);
+    assert.equal(out.accounts.find((a: { id: string }) => a.id === 'claude-main').isDefault, true);
+    // Not the models list or config folder: that's tb accounts <account> --json.
+    assert.equal(three.configDir, undefined);
   } finally {
     await server.close();
   }

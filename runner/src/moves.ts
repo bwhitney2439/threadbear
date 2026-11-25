@@ -1,4 +1,4 @@
-// Moving a thread to another runner, on each runner (docs/protocol.md,
+// Moving a thread to another runner, on each runner (docs/protocol/moves.md,
 // "Moving a thread to another runner"). The backend's threadMoves rows say
 // whose turn it is (convex/moves.ts); this watches the ones this runner is
 // in and takes its step on each, so a restart carries on from the state:
@@ -17,7 +17,9 @@
 import type { PackEntry } from './move-pack.ts';
 import { archive, chunks, MAX_SEALED_BYTES, sealInfo, sha256, unarchive, biggest } from './move-pack.ts';
 import { sealBytes } from './secrets.ts';
+import { createHash, randomBytes } from 'node:crypto';
 import { withoutCredentials } from './move-git.ts';
+import { isPermissionMode, type PermissionMode } from './protocol.ts';
 
 export type MoveState = 'asking' | 'ready' | 'packing' | 'unpacking' | 'claimed' | 'done' | 'failed' | 'cancelled';
 
@@ -40,14 +42,27 @@ export type MoveInfo = {
   schedules: number;
 };
 
-// A MoveInfo from what came over the relay (a `moves.preview` call), with
-// only its own fields and each of the right type; undefined if a needed one
-// is missing. The backend is owner-only for calls, but isn't trusted to
-// have checked the shape.
+// A MoveInfo from what the thread's runner said (a `moves.preview` call
+// over the relay, or the move's row as moves:moveInfo stored it), with only
+// its own fields, each of the right type and size and with no control
+// characters; undefined if a needed one is missing or any is malformed.
+// That runner may be an extra Mac, and the backend isn't trusted to have
+// checked the shape (Daybreak 136, 16 Nov 2026: planMove read the row's
+// info as it came).
+const INFO_CHARS = 4096;
 export function moveInfoFrom(raw: unknown): MoveInfo | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const o = raw as Record<string, unknown>;
-  const s = (k: string) => (typeof o[k] === 'string' ? (o[k] as string) : undefined);
+  let bad = false;
+  const s = (k: string) => {
+    const v = o[k];
+    if (v === undefined) return undefined;
+    if (typeof v !== 'string' || v.length > INFO_CHARS || /[\u0000-\u001f\u007f]/.test(v)) {
+      bad = true;
+      return undefined;
+    }
+    return v;
+  };
   const title = s('title') ?? '';
   const cwd = s('cwd');
   const home = s('home');
@@ -60,7 +75,56 @@ export function moveInfoFrom(raw: unknown): MoveInfo | undefined {
     const v = s(k);
     if (v !== undefined) info[k] = v;
   }
+  if (bad) return undefined;
+  if (info.subdir !== undefined && cleanSubdir(info.subdir) === undefined) return undefined;
   return info;
+}
+
+// The thread's folder inside its repo, as the old runner says it: '' or
+// plain names joined by `/`, never absolute, `.`, `..`, an empty or
+// encoded one, or a backslash, so it can only name a folder under the
+// repo it's joined to. Undefined if it isn't (Daybreak 136, 16 Nov 2026:
+// `../../elsewhere` put the moved thread outside its repo).
+export function cleanSubdir(subdir: string): string | undefined {
+  if (subdir === '') return '';
+  if (subdir.length > 1024 || subdir.startsWith('/') || /[\\\u0000-\u001f\u007f]/.test(subdir)) return undefined;
+  const parts = subdir.split('/');
+  if (parts.some((p) => !p || p === '.' || p === '..' || /%(?:2e|2f|5c|00)/i.test(p))) return undefined;
+  return subdir;
+}
+
+// What a move's preview showed, as one digest (docs/protocol/moves.md, "Moving a
+// thread to another runner", Preview binding): the thread, the runner it
+// goes to, what was picked, the planning half of the old runner's
+// description and the target's plan. The main Mac's runner works it out
+// from the preview and puts it on the move (startMove's `expect`); the
+// runner it goes to works it out again from the description it's given
+// and its own plan, and refuses the move if the two differ, so the old
+// runner can't describe one thing to the preview and another to the move
+// (Daybreak 142, 16 Nov 2026).
+export type MoveBindingPlan = { cwd?: string; accountId?: string; worktree?: boolean; clone?: string; cloneFrom?: string };
+export function moveBinding(p: { threadId: string; to: string; cwd?: string; accountId?: string; info: MoveInfo; plan: MoveBindingPlan }): string {
+  const i = p.info;
+  const canonical = JSON.stringify([
+    'threadbear-move-preview-1',
+    p.threadId,
+    p.to,
+    p.cwd ?? null,
+    p.accountId ?? null,
+    // An empty field is the same as none: the backend leaves empty strings
+    // out of the description on the move's row (convex/moves.ts
+    // describedThread), while the preview's came over the relay with them,
+    // so a thread at the top of its repo (subdir "") failed every move as
+    // "changed since the Move sheet looked" (18 Nov 2026).
+    [i.cwd, i.home, i.provider, i.email || null, (i.origin && withoutCredentials(i.origin)) || null, i.repoTop || null, i.subdir || null, i.worktree],
+    [p.plan.cwd ?? null, p.plan.accountId ?? null, p.plan.worktree === true, p.plan.clone ?? null, p.plan.clone ? (p.plan.cloneFrom ?? null) : null],
+  ]);
+  return createHash('sha256').update(canonical).digest('hex');
+}
+
+// The binding of a plan the target made (MovePlan), as moveBinding takes it.
+export function planBinding(plan: MovePlan): MoveBindingPlan {
+  return { cwd: plan.cwd, accountId: plan.accountId, worktree: Boolean(plan.worktree), ...(plan.clone ? { clone: plan.clone.to, cloneFrom: plan.clone.url } : {}) };
 }
 
 // The runner `asked` names for move_thread: its id, its whole name, or a
@@ -100,7 +164,9 @@ export function stillRunner(runnerId: string, runnerName: string, all: readonly 
 // to a thread runs on the thread's), no other runner. A check is set
 // again on the runner that runs it, with its own card (security review,
 // 10 Nov 2026). `dropped` counts the checks left off, for the thread's note.
-export type MovedSchedule = { text: string; title?: string; cron?: string; at?: string; timezone?: string; paused?: boolean; createdBy?: string };
+// `ceiling`: the one it had there (schedules.ts, "Ceilings"), which can
+// only lower the one it gets here.
+export type MovedSchedule = { text: string; title?: string; cron?: string; at?: string; timezone?: string; paused?: boolean; createdBy?: string; ceiling?: PermissionMode };
 export function movedSchedules(raw: unknown, threadId: string): { schedules: MovedSchedule[]; dropped: number } {
   const schedules: MovedSchedule[] = [];
   let dropped = 0;
@@ -115,7 +181,7 @@ export function movedSchedules(raw: unknown, threadId: string): { schedules: Mov
     if (!text || !cron === !at) continue;
     const title = str('title', 200);
     const timezone = str('timezone', 100);
-    schedules.push({ text, ...(title ? { title } : {}), ...(cron ? { cron } : { at: at! }), ...(timezone ? { timezone } : {}), ...(o.paused === true ? { paused: true } : {}), ...(o.createdBy === threadId ? { createdBy: threadId } : {}) });
+    schedules.push({ text, ...(title ? { title } : {}), ...(cron ? { cron } : { at: at! }), ...(timezone ? { timezone } : {}), ...(o.paused === true ? { paused: true } : {}), ...(o.createdBy === threadId ? { createdBy: threadId } : {}), ...(isPermissionMode(o.ceiling) ? { ceiling: o.ceiling === 'plan' ? 'ask' : o.ceiling } : {}) });
   }
   return { schedules, dropped };
 }
@@ -137,11 +203,75 @@ export function previewInfo(info: MoveInfo, scrub: <T>(v: T) => T): Record<strin
     worktree: info.worktree,
     schedules: 0,
     ...(info.email ? { email: info.email } : {}),
-    ...(info.origin ? { origin: withoutCredentials(info.origin) } : {}),
+    ...(info.origin && withoutCredentials(info.origin) ? { origin: withoutCredentials(info.origin) } : {}),
     ...(info.repoTop ? { repoTop: info.repoTop } : {}),
     ...(info.subdir !== undefined ? { subdir: info.subdir } : {}),
   };
   return scrub(out);
+}
+
+// The previews the main Mac's runner has shown (the Move sheet, tb move,
+// move_thread), by a one-use id threads.move takes: each remembers the
+// thread, runner and picks it was asked with and the binding of what it
+// showed (moveBinding), for ten minutes. `take` gives the binding once,
+// for those same thread, runner and picks, or throws (Daybreak 142,
+// 16 Nov 2026).
+type Picks = { threadId: string; to: string; cwd?: string; accountId?: string };
+export class MovePreviews {
+  static readonly MS = 10 * 60_000;
+  static readonly VOUCHED_MS = 24 * 60 * 60_000;
+  private kept = new Map<string, Picks & { expect: string; at: number }>();
+  // Bindings taken for a move, for a day, each for the one move that first
+  // carries it (startedAs, or vouches): the ones a move coming to this
+  // runner may carry. A cancelled move's binding under a new move's id is
+  // no binding (security review, 17 Nov 2026).
+  private taken = new Map<string, { at: number; moveId?: string }>();
+  private now: () => number;
+  constructor(now: () => number = Date.now) {
+    this.now = now;
+  }
+
+  // A preview's answer as it goes back: a previewId when nothing in it
+  // stops the move and it names the place and login, bound to `info` (the
+  // description the target planned from).
+  remember(picks: Picks, info: MoveInfo | undefined, answer: Record<string, unknown>): Record<string, unknown> {
+    const { previewId: _theirs, ...out } = answer;
+    const text = (v: unknown) => (typeof v === 'string' && v ? v : undefined);
+    const problems = Array.isArray(answer.problems) ? answer.problems : [];
+    if (!info || problems.length || answer.checksPreview !== true || !text(answer.cwd) || !text(answer.accountId)) return out;
+    const plan: MoveBindingPlan = { cwd: text(answer.cwd), accountId: text(answer.accountId), worktree: answer.worktree === true, ...(text(answer.clone) ? { clone: text(answer.clone), cloneFrom: text(answer.cloneFrom) ?? info.origin } : {}) };
+    const expect = moveBinding({ ...picks, info, plan });
+    for (const [id, v] of this.kept) if (this.now() - v.at > MovePreviews.MS) this.kept.delete(id);
+    while (this.kept.size >= 200) this.kept.delete(this.kept.keys().next().value!);
+    const previewId = randomBytes(16).toString('hex');
+    this.kept.set(previewId, { ...picks, expect, at: this.now() });
+    return { ...out, previewId };
+  }
+
+  take(previewId: string, picks: Picks): string {
+    const seen = this.kept.get(previewId);
+    this.kept.delete(previewId);
+    if (!seen || this.now() - seen.at > MovePreviews.MS) throw new Error("That look at the move has run out or been used. Move it again to see where it would go now.");
+    if (seen.threadId !== picks.threadId || seen.to !== picks.to || seen.cwd !== picks.cwd || seen.accountId !== picks.accountId) throw new Error('The move asked for differs from the one its preview showed. Move it again to see where it would go now.');
+    for (const [e, t] of this.taken) if (this.now() - t.at > MovePreviews.VOUCHED_MS) this.taken.delete(e);
+    while (this.taken.size >= 500) this.taken.delete(this.taken.keys().next().value!);
+    this.taken.set(seen.expect, { at: this.now() });
+    return seen.expect;
+  }
+
+  // The move a taken binding started (startMove's answer).
+  startedAs(expect: string, moveId: string): void {
+    const t = this.taken.get(expect);
+    if (t && t.moveId === undefined) t.moveId = moveId;
+  }
+
+  vouches(expect: string, moveId: string): boolean {
+    const t = this.taken.get(expect);
+    if (!t || this.now() - t.at > MovePreviews.VOUCHED_MS) return false;
+    // A move this runner takes in before startMove has answered is that one.
+    t.moveId ??= moveId;
+    return t.moveId === moveId;
+  }
 }
 
 // Where T will run it (moves:moveReady).
@@ -150,6 +280,9 @@ export type MovePlan = {
   accountId: string;
   worktree?: { repo: string; subdir: string };
   clone?: { url: string; to: string };
+  // The folder the thread's own must stay inside, links followed: its
+  // repo, Mike's pick, or the home folder (runner/moves.ts placeMove).
+  within?: string;
   leftBehind: string[];
 };
 
@@ -161,6 +294,8 @@ export type MoveRow = {
   state: MoveState;
   cwd?: string;
   accountId?: string;
+  // What the preview showed (moveBinding), set by the main Mac's runner.
+  expect?: string;
   info?: MoveInfo;
   plan?: MovePlan;
   key?: string;
@@ -186,6 +321,16 @@ export type MovePreview = {
   problems: string[];
   worktree?: boolean;
   clone?: string;
+  // The address it's cloned from, shown with `clone`.
+  cloneFrom?: string;
+  // The main Mac's runner's: Move passes it to threads.move, once, so the
+  // move does what this showed or nothing (moveBinding).
+  previewId?: string;
+  // The target's own: it checks a move against its preview (mustMatchPreview).
+  // The main Mac's runner gives no previewId without it, as a runner from
+  // before that would do whatever the move's row said (security review,
+  // 17 Nov 2026).
+  checksPreview?: boolean;
 };
 
 // What ThreadSummary.moving says on S while it goes.
@@ -214,6 +359,9 @@ export type MovesHost = {
   // Places it beside the live threads (its staging folder, worktree, git
   // work and transcript), not yet one of them. Throws to fail the move.
   place(row: MoveRow, entries: PackEntry[]): Promise<void>;
+  // Whether place() finished for this move here already (before a restart),
+  // so only the claim is left. Optional: a host without it places again.
+  placed?(row: MoveRow): boolean;
   // After the switch: makes it one of this runner's threads. Idempotent.
   adopt(row: MoveRow): Promise<void>;
   // The move failed or was cancelled: what place() made goes.
@@ -234,6 +382,11 @@ export type MovesDeps = {
   // Every row as it's heard, for the main Mac to show a move coming to it of
   // a thread its sidebar lists as another runner's (main.ts remoteMoving).
   seen?: (row: MoveRow) => void;
+  // On the main Mac's runner, which starts every move: whether it handed out
+  // this binding itself (MovePreviews.vouches). The row's `expect` is the
+  // backend's word like the rest of it, so a move coming here takes it only
+  // as one of its own (security review, 17 Nov 2026).
+  vouches?: (expect: string, moveId: string) => boolean;
 };
 
 const ENDED: MoveState[] = ['done', 'failed', 'cancelled'];
@@ -250,8 +403,18 @@ export class Moves {
   // Steps done here (moveId:state), so an update that hasn't caught up yet
   // doesn't start the same one again.
   private done = new Set<string>();
+  // Moves seen ended (done, failed, cancelled) or failed here: a row of one
+  // later in an earlier state is the backend's word, and a move never comes
+  // back from its end, so it's left alone (security review, 17 Nov 2026: a
+  // cancelled move's row put back at unpacking).
+  private ended = new Set<string>();
+  // Moves whose thread T has placed (asTarget, unpacking): from then on only
+  // the claim is asked again, never the thread placed twice.
+  private placed = new Set<string>();
   private stop?: () => void;
   private idleTimer?: { cancel(): void };
+  // Steps to try again (see `retry`), by move, with how many tries so far.
+  private retries = new Map<string, { timer?: { cancel(): void }; tries: number }>();
 
   constructor(deps: MovesDeps) {
     this.d = deps;
@@ -271,6 +434,8 @@ export class Moves {
     this.stop?.();
     this.stop = undefined;
     this.idleTimer?.cancel();
+    for (const r of this.retries.values()) r.timer?.cancel();
+    this.retries.clear();
   }
 
   // Threads leaving this runner whose rows it must no longer write: past
@@ -299,6 +464,9 @@ export class Moves {
   }
 
   update(rows: MoveRow[]): void {
+    // A move seen ended stays ended here, whatever a later row says (see
+    // `ended`), so a cancel waiting on a step in flight isn't replaced.
+    rows = rows.filter((r) => ENDED.includes(r.state) || !this.ended.has(r.moveId));
     for (const r of rows) this.rows.set(r.moveId, r);
     for (const r of rows) this.d.seen?.(r);
     for (const r of rows) void this.step(r);
@@ -308,6 +476,10 @@ export class Moves {
     const me = this.d.self();
     const key = `${row.moveId}:${row.state}`;
     if (this.done.has(key)) return;
+    if (ENDED.includes(row.state)) {
+      this.ended.add(row.moveId);
+      this.placed.delete(row.moveId);
+    } else if (this.ended.has(row.moveId)) return;
     // A step is running: the row it's on may be stale by the time it ends
     // (cancelled while packing), and the backend says nothing more unless
     // the row changes again, so the newest one goes once it does.
@@ -320,13 +492,32 @@ export class Moves {
       if (row.from === me) await this.asSource(row);
       else if (row.to === me) await this.asTarget(row);
       this.done.add(key);
+      this.retries.delete(row.moveId);
     } catch (e) {
       // Not yet (the turn isn't over, the thread isn't described): the
       // next update or look tries again.
       if (e instanceof Waiting) return;
       const note = e instanceof Error ? e.message : String(e);
+      // T's adopt or done not going through after the switch, where there's
+      // nothing to fail, and a move left claimed would keep the thread from
+      // ever moving again: the same step again shortly (adopt can run
+      // again), not the move given up.
+      // T's claim not going through after it placed the thread: asked again,
+      // not the move failed. Its reply may only have been lost (a POST
+      // timeout, a reset) with the claim made, and a claimed move can't
+      // fail: taken as ended here, its claimed row was dropped and the
+      // thread was on neither runner until T restarted (review, 23 Nov
+      // 2026). moveClaim answers a claimed move as done, so asking again is
+      // safe either way, and one that never goes through ends at the
+      // backend's thirty minutes (TOO_SLOW), whose failed row discards it.
+      if (row.state === 'claimed' || (row.state === 'unpacking' && this.placed.has(row.moveId))) {
+        this.d.log.warn('a move step will be tried again', { moveId: row.moveId, state: row.state, error: note });
+        this.retry(row);
+        return;
+      }
       this.d.log.warn('a move step failed', { moveId: row.moveId, state: row.state, error: note });
-      if (!ENDED.includes(row.state) && row.state !== 'claimed') {
+      if (!ENDED.includes(row.state)) {
+        this.ended.add(row.moveId);
         await this.backend()
           .call('moveFailed', { moveId: row.moveId, note })
           .catch((err) => this.d.log.warn("couldn't fail a move", { moveId: row.moveId, error: String(err) }));
@@ -341,10 +532,34 @@ export class Moves {
     }
   }
 
+  // The backend, with each call asked again while the backend says it's
+  // being updated (a deploy's stepping stone, convex/stepping.ts: a minute
+  // or so): only the call, so a step that has already uploaded a bundle or
+  // placed a thread doesn't do it again (Codex's review).
+  private over(moveId: unknown): boolean {
+    const row = typeof moveId === 'string' ? this.rows.get(moveId) : undefined;
+    return !!row && ENDED.includes(row.state);
+  }
+
   private backend(): MovesBackend {
     const b = this.d.backend();
     if (!b) throw new Error("This runner isn't connected to Threadbear's backend.");
-    return b;
+    return {
+      ...b,
+      call: async (fn, args) => {
+        for (let tries = 1; ; tries++) {
+          try {
+            return await b.call(fn, args);
+          } catch (e) {
+            if (tries >= UPDATING_TRIES || !BEING_UPDATED.test(e instanceof Error ? e.message : String(e)) || this.over(args.moveId)) throw e;
+            this.d.log.warn('the backend is being updated: asking again shortly', { fn });
+            await new Promise<void>((done) => (this.d.setTimer ?? defaultTimer)(done, Math.min(RETRY_MAX_MS, RETRY_MS * 2 ** (tries - 1))));
+            // Ended while it waited (cancelled): its own row's step tidies up.
+            if (this.over(args.moveId)) throw e;
+          }
+        }
+      },
+    };
   }
 
   private moving(row: MoveRow, note?: string): ThreadMoving {
@@ -409,6 +624,10 @@ export class Moves {
       case 'failed':
       case 'cancelled': {
         if (!host.has(id)) return;
+        // Another move of the thread has started since (this one's step ran
+        // late, after a wait): what the thread shows is that one's (Codex's review).
+        const now = this.movingOf(id);
+        if (now && now.moveId !== row.moveId) return;
         // A move that ended long ago (seen again after a restart) says nothing.
         if (Date.now() - row.updatedAt > FAILED_SHOWN_MS) host.setMoving(id, undefined);
         else {
@@ -430,18 +649,38 @@ export class Moves {
         if (!row.info) throw new Waiting();
         const plan = await host.plan(row);
         if ('problem' in plan) throw new Error(plan.problem);
+        this.mustMatchPreview(row, plan);
         await this.backend().call('moveReady', { moveId: row.moveId, plan, sealKey: host.sealKey() });
         return;
       }
       case 'unpacking': {
         const backend = this.backend();
+        // Placed already, its claim tried again (step), or placed whole
+        // before this runner restarted: only the claim is left.
+        // The main Mac's runner still has to have started it (vouches),
+        // as when it was placed; one restarted since places afresh and
+        // fails there, as before.
+        const resumed = !this.placed.has(row.moveId) && !!host.placed?.(row) && (!this.d.vouches || (!!row.expect && this.d.vouches(row.expect, row.moveId)));
+        if (this.placed.has(row.moveId) || resumed) {
+          this.placed.add(row.moveId);
+          await backend.call('moveClaim', { moveId: row.moveId });
+          return;
+        }
+        // Again before anything comes: placing plans afresh from the same
+        // description (runner/moves.ts placeMove), never from the row's plan.
+        const plan = await host.plan(row);
+        if ('problem' in plan) throw new Error(plan.problem);
+        this.mustMatchPreview(row, plan);
         const urls = (await backend.call('moveChunks', { moveId: row.moveId })) as string[];
         const parts: Buffer[] = [];
         for (const url of urls) parts.push(await backend.download(url));
         const sealed = Buffer.concat(parts);
         if (row.sha256 && sha256(sealed) !== row.sha256) throw new Error("The moved thread's bundle didn't arrive whole.");
         const entries = unarchive(host.open(sealed, sealInfo(row.moveId)));
+        // Cancelled while it downloaded: nothing placed.
+        if (this.ended.has(row.moveId)) throw new Error('The move ended while its thread was on its way.');
         await host.place(row, entries);
+        this.placed.add(row.moveId);
         await backend.call('moveClaim', { moveId: row.moveId });
         return;
       }
@@ -458,8 +697,37 @@ export class Moves {
     }
   }
 
+  // The move does what its preview showed or nothing (moveBinding): the
+  // description and this runner's plan from it, against the digest the
+  // main Mac's runner put on the move. One with none was started by a
+  // runner from before previews were bound, or not through a preview: it
+  // fails, and Move asks again.
+  private mustMatchPreview(row: MoveRow, plan: MovePlan): void {
+    const info = moveInfoFrom(row.info);
+    if (!info) throw new Error("The thread's runner didn't describe it properly, so it stays there.");
+    if (!row.expect) throw new Error('The move was started without a preview, so the thread stays where it is. Move it again.');
+    if (this.d.vouches && !this.d.vouches(row.expect, row.moveId)) throw new Error("This Mac's runner didn't start that move (or has restarted since), so the thread stays where it is. Move it again.");
+    const now = moveBinding({ threadId: row.threadId, to: row.to, ...(row.cwd ? { cwd: row.cwd } : {}), ...(row.accountId ? { accountId: row.accountId } : {}), info, plan: planBinding(plan) });
+    if (now !== row.expect) throw new Error('The thread or where it would go changed since the Move sheet looked, so it stays where it is. Move it again to see where it would go now.');
+  }
+
   // While a thread finishes its turn: every few seconds, the moves waiting
   // on an idle thread are tried again.
+  // The row's step again after a while, longer each time (20 s up to 5
+  // minutes), while the row is still in that state.
+  // A step that goes through forgets the tries (step).
+  private retry(row: MoveRow): void {
+    const r = this.retries.get(row.moveId) ?? { tries: 0 };
+    r.timer?.cancel();
+    r.tries++;
+    r.timer = (this.d.setTimer ?? defaultTimer)(() => {
+      r.timer = undefined;
+      const latest = this.rows.get(row.moveId);
+      if (latest && latest.state === row.state) void this.step(latest);
+    }, Math.min(RETRY_MAX_MS, RETRY_MS * 2 ** (r.tries - 1)));
+    this.retries.set(row.moveId, r);
+  }
+
   private lookAgain(): void {
     if (this.idleTimer) return;
     this.idleTimer = (this.d.setTimer ?? defaultTimer)(() => {
@@ -468,6 +736,14 @@ export class Moves {
     }, this.d.idleCheckMs ?? 3000);
   }
 }
+
+// What the backend says while a deploy's stepping stone has a machine off.
+const BEING_UPDATED = /The backend is being updated/;
+const RETRY_MS = 20_000;
+const RETRY_MAX_MS = 5 * 60_000;
+// 20 s, 40 s, 80 s, 160 s, then 5 minutes: about 20 minutes, far past a
+// stepping stone's minute, before the step fails as any other error would.
+const UPDATING_TRIES = 7;
 
 // A step that can't be taken yet: not a failure.
 class Waiting extends Error {

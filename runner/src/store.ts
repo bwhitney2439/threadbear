@@ -5,7 +5,7 @@ import type { WaitingForRoom, Ask, AskAnswer, NeedsWho, DesignReview, ReplyButto
 import { atomicWriteFileSync, readJsonSync } from './fsutil.ts';
 import { paths } from './config.ts';
 import type { WorktreeRecord } from './worktrees.ts';
-import type { WakeWhen } from './wake-when.ts';
+import type { LateChecks, WakeWhen } from './wake-when.ts';
 
 // Review by another lab's ledger as the runner keeps it: what goes on the
 // card (LabReviewLedger), plus where it is. delivered: the latest round's
@@ -15,11 +15,15 @@ export type LabLedger = LabReviewLedger & { delivered?: number; answered?: numbe
 // A reviewer's verdict: its findings, none when nothing holds up.
 export type ReviewVerdict = { findings: Pick<ReviewFinding, 'severity' | 'claim' | 'where' | 'case'>[] };
 
-export type QueuedSend = { beforeMessage?: true; retryAfterInterrupt?: true; preserveSchedule?: boolean; scheduledSince?: number; turnId: string; text: string; images: ImageRef[]; origin?: MessageOrigin; scheduleId?: string; reviewId?: string; reviewResponse?: ReviewDraft; answers?: AskAnswer[]; editOf?: number };
+export type QueuedSend = { beforeMessage?: true; retryAfterInterrupt?: true; preserveSchedule?: boolean; scheduledSince?: number; turnId: string; text: string; images: ImageRef[]; origin?: MessageOrigin; wakeReason?: string; scheduleId?: string; reviewId?: string; reviewResponse?: ReviewDraft; answers?: AskAnswer[]; editOf?: number; ceiling?: PermissionMode; seq?: number };
 
 // What thread.json holds: the public summary fields plus a few internal ones.
 // A report held for a thread from one it started (runner/nested.ts).
-export type HeldReport = { from: string; text: string; at: string };
+// `ceiling`: the most access the starter may have when it's passed on
+// (runner/ceiling.ts).
+export type HeldReport = { from: string; text: string; at: string; ceiling?: PermissionMode };
+// An email kept for a thread's next turn (runner/mail.ts).
+export type HeldMail = { text: string; at: string };
 export type PressNote = { id: string; line: string; told?: { seq: number; inFlight?: boolean } };
 
 // A thread's press notes as read from disk, where another runner may have
@@ -55,10 +59,10 @@ export function cleanPresses(raw: unknown): PressNote[] | undefined {
 // summary and the start loop walk these for every thread: `presses: {}`,
 // then `queue: {}`, stopped the runner at every start (security review and
 // Muse's review of the fix, 11 Nov 2026, finding 96). True if it changed.
-const OBJECT_LISTS = ['heldReports', 'waitingOn', 'reviews', 'buttons', 'subagents', 'projects', 'rewinds', 'queue', 'messageRecoveries'];
+const OBJECT_LISTS = ['heldReports', 'heldMail', 'waitingOn', 'reviews', 'buttons', 'subagents', 'projects', 'rewinds', 'queue', 'messageRecoveries'];
 const STRING_LISTS = ['reviewDeliveries', 'allowRules', 'pendingApprovals', 'projectsLeft', 'projectsTold'];
-const NUMBER_LISTS = ['interruptedMessages'];
-const OBJECTS = ['needs', 'looseEnds', 'stoppedWork', 'stoppedMidTurn', 'highlights', 'worktree', 'handoff', 'moved', 'startedBy', 'labReview', 'labReviewOwed', 'reviewVerdict', 'finished'];
+const NUMBER_LISTS = ['interruptedMessages', 'withheldSeqs'];
+const OBJECTS = ['wakeCeiling', 'needs', 'looseEnds', 'stoppedWork', 'stoppedMidTurn', 'highlights', 'worktree', 'handoff', 'moved', 'startedBy', 'labReview', 'labReviewOwed', 'reviewVerdict', 'finished', 'lateChecks', 'wakeNews'];
 const NESTED: [string, string, 'object' | 'string' | 'number'][] = [
   ['needs', 'asks', 'object'],
   ['needs', 'ticked', 'number'],
@@ -69,8 +73,12 @@ const NESTED: [string, string, 'object' | 'string' | 'number'][] = [
   ['highlights', 'edited', 'string'],
   ['highlights', 'removed', 'string'],
   ['labReview', 'findings', 'object'],
+  ['labReview', 'panel', 'object'],
   ['reviewVerdict', 'findings', 'object'],
 ];
+// The longest a wake's line for the agent is (wake-when.ts, lateNews: the
+// agent's words, 300 at most, a topic of 80 and a few sentences).
+const WAKE_NEWS_MAX = 2000;
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 function listOf(v: unknown, kind: 'object' | 'string' | 'number'): unknown[] | undefined {
   if (!Array.isArray(v)) return undefined;
@@ -105,7 +113,8 @@ export function normaliseRecord(rec: Record<string, unknown>): boolean {
     const waits = rec.waitingOn.filter((w) => typeof w.threadId === 'string' && typeof (w.title ?? '') === 'string' && (w.done === undefined || (isObject(w.done) && typeof (w.done.reply ?? '') === 'string' && typeof (w.done.why ?? '') === 'string')));
     rec.waitingOn = waits;
     // A `by` that isn't one is dropped, and the wait counts as from the least (hibernation.ts, mayHear).
-    for (const w of waits) if (w.by !== undefined && !(isObject(w.by) && ['ask', 'plan', 'auto', 'full'].includes(w.by.mode) && typeof w.by.confined === 'boolean')) delete w.by;
+    // One saved by a thread in the old sandbox (`confined: true`) counts as the least too.
+    for (const w of waits) if (w.by !== undefined && !(isObject(w.by) && ['ask', 'plan', 'auto', 'full'].includes(w.by.mode) && (w.by as { confined?: unknown }).confined !== true)) delete w.by;
   }
   // What it said last, which a wait on it carries.
   if (isObject(rec.finished) && rec.finished.reply !== undefined && typeof rec.finished.reply !== 'string') delete rec.finished.reply;
@@ -114,6 +123,16 @@ export function normaliseRecord(rec: Record<string, unknown>): boolean {
     const presses = cleanPresses(rec.presses);
     if (presses) rec.presses = presses;
     else delete rec.presses;
+  }
+  // Why it last woke by itself, as a line for its agent (Runner.takeWakeNews).
+  // Another runner may have written it (a move): only the shape, and the
+  // length, the runner writes.
+  if (isObject(rec.wakeNews)) {
+    const n = rec.wakeNews;
+    const told = n.told;
+    const ok = typeof n.text === 'string' && n.text.length <= WAKE_NEWS_MAX && (n.check === undefined || typeof n.check === 'string') && (n.at === undefined || typeof n.at === 'string') &&
+      (told === undefined || (isObject(told) && Number.isFinite(told.seq) && (told.inFlight === undefined || told.inFlight === true) && (told.deferred === undefined || told.deferred === true)));
+    if (!ok) delete rec.wakeNews;
   }
   if (rec.title !== undefined && typeof rec.title !== 'string') rec.title = String(rec.title);
   return JSON.stringify(rec) !== before;
@@ -142,6 +161,13 @@ export type ThreadRecord = {
   // (Runner.onNetworkLost). `since` is when the line first went, `tries`
   // the carry-ons sent since. Kept here so the wait survives a restart.
   waitingForNetwork?: { since: string; tries: number };
+  // Box mode: a turn was refused with the box's cloud token (errorKind auth):
+  // the thread waits, turns held, until the backend has a newer token for
+  // its login (Runner.holdForToken, box-token.ts). Kept across restarts.
+  // `refusedSetAt`: which token was refused (box.json's tokenSetAt then);
+  // `reported`: the backend has heard (boxes:tokenRefused), so a restart
+  // before it did says it again, with that version, never a newer one's.
+  waitingForToken?: { since: string; turnId: string; refusedSetAt?: number; reported?: boolean };
   // The runner's own carry-on after that, so if it can't get through
   // either the thread waits again, counting on from the same outage.
   netCarryOn?: { turnId: string; since: string; tries: number };
@@ -162,12 +188,9 @@ export type ThreadRecord = {
   modelInUse?: string; // full id the CLI ran the last turn on
   effortInUse?: EffortLevel; // the level the CLI reported for the last turn
   permissionMode: PermissionMode;
-  // Its CLI runs in a sandbox (sandbox.ts) and must stay in one: set when it
-  // starts in a sandbox folder or a sandboxed thread's agent starts it
-  // there, and taken off only by a move Mike made or allowed. A thread with
-  // it never starts outside a sandbox, whatever its folder has become
-  // (Daybreak, 7 Nov 2026), and its agent counts as restricted
-  // (threadbear-mcp.ts, "Raising access").
+  // It ran in the sandboxed-threads experiment, taken out 16 Nov 2026. Never
+  // set now: one that has it won't start (Runner.retiredSandbox), as its
+  // owner expected it to stay shut in a container.
   confined?: true;
   // "Plan first": the mode approving the plan goes back to, and the plan
   // waiting for Mike (its plan.proposed itemId).
@@ -177,6 +200,9 @@ export type ThreadRecord = {
   createdAt: string;
   updatedAt: string;
   lastActivityAt: string;
+  // When the thread last moved to its folder (cwd), if since it was made:
+  // a slot lent out after this was lent from under it (lentFolder).
+  cwdAt?: string;
   snoozedUntil?: string;
   snoozedUntilRestart?: boolean; // snoozedUntil is UNTIL_RESTART; start() wakes it
   untilRelease?: string; // with snoozedUntilRestart: only a start on another release wakes it
@@ -186,6 +212,25 @@ export type ThreadRecord = {
   // a snooze again with the same words isn't woken again by the same claim
   // until that thread says more (Codex's review, 13 Nov 2026).
   wakeChecked?: { said: string; from: Record<string, number> };
+  // An agent's wait for something to happen whose latest time passed with
+  // nothing seen (wake-when.ts, "The latest time passing"): the turns it has
+  // been given to check, in a row since Mike last wrote to the thread. Not
+  // tied to its words, so saying them another way each time can't start the
+  // count again.
+  lateChecks?: LateChecks;
+  // A wake at a wait's latest time, as a line its agent gets with the
+  // thread's next message (Runner.takeWakeNews), so it can say why the
+  // thread came back. `told`: the message it went with, as a press's
+  // (PressNote): kept if that turn completed, told again otherwise, or if
+  // Mike goes back to before it or the thread moves to a fresh session.
+  // `check`: the wake sent a message to check (its id), which says it all
+  // itself, so the line goes only with another message and is dropped once
+  // the check's turn completes. Gone once the thread next sleeps.
+  // `at`: when it woke. A line a completed turn heard is kept only
+  // LATE_NEWS_KEPT_MS from then.
+  // `told.deferred`: what it was told was that the check comes next.
+  // `ceiling`: its text repeats its agent's snooze words (runner/ceiling.ts).
+  wakeNews?: { text: string; at?: string; told?: { seq: number; inFlight?: true; deferred?: true }; check?: string; ceiling?: PermissionMode };
   // Hibernating until these threads finish (end_turn's waitFor,
   // runner/hibernation.ts): each counts once it has finished (with no new
   // work since), been archived or been deleted.
@@ -194,7 +239,11 @@ export type ThreadRecord = {
   // `review`: the thread is a review of this one's change (runner/lab-review.ts).
   // `by`: the waiting thread's access when it said to wait (hibernation.ts,
   // mayHear): what it asked to hear isn't passed on once it has more.
-  waitingOn?: { threadId: string; title: string; until?: string; review?: true; quiet?: true; by?: { mode: PermissionMode; confined: boolean }; done?: { at: string; how: 'finished' | 'met' | 'archived' | 'deleted'; reply?: string; why?: string } }[];
+  waitingOn?: { threadId: string; title: string; until?: string; review?: true; by?: { mode: PermissionMode }; done?: { at: string; how: 'finished' | 'met' | 'archived' | 'deleted'; reply?: string; why?: string; verdict?: ReviewVerdict; edited?: string[] } }[];
+  // Hibernating until Mike's app restarts onto what its turn landed
+  // (wait_for_app_restart), not for him: sent as awaitingAppRestart, so the
+  // app keeps it under Running. Cleared with the rest of a wait.
+  hibernatedForApp?: true;
   // Its last finished turn (nothing needed, nothing left running) and that
   // turn's reply, for threads waiting on it, including on a runner it
   // moves to (runner/hibernation.ts, reconcileWaits). Cleared by any new
@@ -230,18 +279,34 @@ export type ThreadRecord = {
   // helper thread that would archive itself when it finishes stays in the
   // inbox instead (runner/quiet-inbox.ts).
   keptOut?: boolean;
+  // What the agent is to be told before its next message, held over from a
+  // turn stopped after the thread moved into a fresh worktree but before
+  // the CLI started (runner.ts deliver, runner/worktrees.ts
+  // leaveRemovedWorktree): a resumed session keeps its old instructions.
+  agentNotice?: string;
   // Started by another thread but not part of its work, so it doesn't
-  // nest under it in the sidebar (docs/protocol.md, "Nested threads").
+  // nest under it in the sidebar (docs/protocol/threads.md, "Nested threads").
   detached?: boolean;
   // Reports the threads it started sent it with send_message, kept until
   // none of them is working (runner/nested.ts).
   heldReports?: HeldReport[];
+  // Messages shown in the transcript that its agent never got: held back
+  // just before their turn sent them (runner/ceiling.ts, heldAtDispatch).
+  withheldSeqs?: number[];
+  // The ceiling of an agent's own words that wake it later (end_turn's
+  // snooze in words, its `said`), as it said them (runner/ceiling.ts).
+  wakeCeiling?: { said: string; ceiling: PermissionMode };
+  // Emails about its work, kept for its agent's next turn (runner/mail.ts).
+  heldMail?: HeldMail[];
   starredAt?: string; // Mike starred it: the Starred section, oldest star first
   preview: string;
   lastSeq: number;
   lastSeenSeq: number;
   nativeSessionId?: string;
   contextTokens?: number;
+  // When the CLI last reported a model call's usage: how long the prompt
+  // cache has sat unused (runner/cold-compact.ts).
+  lastModelAt?: string;
   contextWindow?: number; // the model's window, when the CLI reports it
   // Claude's last breakdown of the context (threads.contextUsage), for when
   // its CLI has gone: only for the native session it was asked of.
@@ -267,7 +332,7 @@ export type ThreadRecord = {
   // its turn.completed and which of its asks he has ticked.
   // (A record from 11 to 13 Nov 2026 may also hold `open`, the agent's own
   // lines for the done card: nothing reads it now.)
-  needs?: { seq: number; needs: NeedsWho; asks?: Ask[]; ticked?: number[] };
+  needs?: { seq: number; needs: NeedsWho; asks?: Ask[]; ticked?: number[]; afterJobs?: string[] };
   // Set when the folder or account changes, or the record had to be
   // rebuilt; the next turn starts a new native session with a note.
   // lost: the session to resume couldn't be found (never saved; only set
@@ -315,6 +380,14 @@ export type ThreadRecord = {
   worktree?: WorktreeRecord;
   // The done card's loose ends (runner/loose-ends.ts), for the card at seq.
   looseEnds?: { seq: number; ends: LooseEnd[]; at: string };
+  // The inboxGuess experiment's guesses for the done card `seq`
+  // (runner/inbox-guess.ts): written down, never acted on.
+  inboxGuess?: { seq: number; guesses: Array<{ by: string; skip: boolean; why: string; strong?: true }> };
+  // Archived by the quietInboxMine experiment for the done card `seq`, with
+  // the strong model's why (runner/inbox-guess.ts). Cleared by any move that
+  // takes it out of the archive, or leaves it archived by someone else
+  // (parkRecord).
+  quietlyArchived?: { at: string; why: string; seq: number };
   // Made in a repo that asks for worktrees and not told otherwise: the
   // first turn makes one (and runs its setup) before the CLI starts.
   worktreePending?: boolean;
@@ -330,16 +403,10 @@ export type ThreadRecord = {
   // its title doesn't say ("dentist" for a wisdom tooth appointment).
   // "" once a look or the keyword sweep found none, so the sweep moves on.
   keywords?: string;
-  // Open threads that may be doing the same work, found as it was made
-  // (same-work.ts), for its first session's instructions. Gone once a
-  // turn has completed.
-  sameWork?: string;
-  // The threads that note names, checked again as it's told.
-  sameWorkIds?: string[];
   // show_panel's request, until the app shows it or Mike sends a message.
   panelRequest?: PanelRequest;
   // The seq ranges edits of earlier messages cut out of the conversation
-  // (docs/protocol.md, "Editing a message"), oldest first. Everything that
+  // (docs/protocol/threads.md, "Editing a message"), oldest first. Everything that
   // reads the thread for the agent or the librarian leaves them out.
   rewinds?: { from: number; to: number }[];
   // Claude: the transcript entry the next start resumes at, after an edit
@@ -350,8 +417,11 @@ export type ThreadRecord = {
 };
 
 // Whether an edit cut the event at `seq` out of the conversation.
-export function cutOut(rec: Pick<ThreadRecord, 'rewinds'>, seq: number): boolean {
-  return rec.rewinds?.some((r) => seq >= r.from && seq <= r.to) ?? false;
+// Taken out by an edit, or a message held back as its turn was about to
+// send it (withheldSeqs, runner/ceiling.ts): never part of what an agent
+// is told the thread said.
+export function cutOut(rec: Pick<ThreadRecord, 'rewinds' | 'withheldSeqs'>, seq: number): boolean {
+  return (rec.rewinds?.some((r) => seq >= r.from && seq <= r.to) ?? false) || (rec.withheldSeqs?.includes(seq) ?? false);
 }
 
 export type ThreadProjectRecord = Omit<ThreadProject, 'title'>;
@@ -588,7 +658,7 @@ export class ThreadStore {
   }
 
   // Drops the cached event log, so the next log() reads the file again:
-  // another runner (a draining one, docs/protocol.md "Handovers") may have
+  // another runner (a draining one, docs/protocol/updates.md "Handovers") may have
   // written to it since.
   forget(id: string): void {
     this.logs.delete(id);

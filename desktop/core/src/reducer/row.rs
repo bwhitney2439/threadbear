@@ -1,7 +1,6 @@
 // One row in the transcript: a port of Transcript/TranscriptRow.swift.
 use super::diff::DiffBuilder;
 use super::event::*;
-use super::groups::{BackgroundStatus, ChangedFiles, WorkGroup, WorkingStatus};
 use super::text;
 use super::turn_gap::TurnGap;
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,7 +31,14 @@ pub struct Row {
 
 impl Row {
     pub fn new(id: &str, seq: i64, turn_id: Option<String>, content: RowContent) -> Row {
-        Row { id: id.to_owned(), version: 0, seq, turn_id, content, in_group: false }
+        Row {
+            id: id.to_owned(),
+            version: 0,
+            seq,
+            turn_id,
+            content,
+            in_group: false,
+        }
     }
 
     pub fn kind(&self) -> RowKind {
@@ -121,7 +127,11 @@ pub struct TextItem {
 
 impl TextItem {
     pub fn new(item_id: &str, text: &str) -> TextItem {
-        TextItem { item_id: item_id.to_owned(), text: text.to_owned(), ..TextItem::default() }
+        TextItem {
+            item_id: item_id.to_owned(),
+            text: text.to_owned(),
+            ..TextItem::default()
+        }
     }
 }
 
@@ -142,6 +152,9 @@ pub struct UserMessage {
     /// "runner" when the runner sent it by itself, "schedule" when a
     /// schedule did, None when a person or a client did.
     pub origin: Option<String>,
+    /// For the runner's own message, what happened in a few words
+    /// (`wakeReason`, "Moved to another login").
+    pub wake_reason: Option<String>,
     /// The asks it answered from the card.
     pub answers: Vec<AskAnswer>,
     /// His answer to a review.
@@ -156,13 +169,17 @@ pub struct UserMessage {
 
 impl UserMessage {
     pub fn new(text: &str) -> UserMessage {
-        UserMessage { text: text.to_owned(), ..UserMessage::default() }
+        UserMessage {
+            text: text.to_owned(),
+            ..UserMessage::default()
+        }
     }
 
     /// Mike wrote it, in the app or on the phone: not the runner, a
     /// schedule or an agent.
     pub fn is_mike(&self) -> bool {
-        (self.origin.is_none() || self.origin.as_deref() == Some("phone")) && self.agent_header().is_none()
+        (self.origin.is_none() || self.origin.as_deref() == Some("phone"))
+            && self.agent_header().is_none()
     }
 
     /// Sent by the runner, not by Mike: a quiet centred line.
@@ -173,6 +190,30 @@ impl UserMessage {
     /// Sent by a schedule: also a note.
     pub fn is_from_schedule(&self) -> bool {
         self.origin.as_deref() == Some("schedule")
+    }
+
+    /// The runner's note's first line: what made it send the message, from
+    /// its wake reason, or that it restarted when that's the reason or
+    /// none came with it (older runners).
+    pub fn runner_header(&self) -> String {
+        const RESTARTED: &str = "Sent by the runner after it restarted";
+        let Some(reason) = self
+            .wake_reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+        else {
+            return RESTARTED.to_owned();
+        };
+        if matches!(reason, "The runner restarted" | "The runner came back") {
+            return RESTARTED.to_owned();
+        }
+        let mut chars = reason.chars();
+        let first = chars
+            .next()
+            .map(|c| c.to_lowercase().collect::<String>())
+            .unwrap_or_default();
+        format!("Sent by the runner: {first}{}", chars.as_str())
     }
 
     /// Drawn as a centred note rather than Mike's bubble.
@@ -226,12 +267,17 @@ impl AgentHeader {
             let split = inner.rfind("\" (")?;
             header.title = inner[..split].to_owned();
             header.thread_id = inner[split + 3..].to_owned();
-        } else if first.starts_with(MOVE) && first.ends_with(']') && text::count(first) > text::count(MOVE) + 1 {
+        } else if first.starts_with(MOVE)
+            && first.ends_with(']')
+            && text::count(first) > text::count(MOVE) + 1
+        {
             header.moved_to = Some(first[MOVE.len()..first.len() - 1].to_owned());
         } else {
             return None;
         }
-        header.body = rest.map(|r| text::trim_newlines(r).to_owned()).unwrap_or_default();
+        header.body = rest
+            .map(|r| text::trim_newlines(r).to_owned())
+            .unwrap_or_default();
         Some(header)
     }
 }
@@ -261,7 +307,9 @@ impl ScheduledHeader {
         Some(ScheduledHeader {
             title: inner[..split].to_owned(),
             when_text: inner[split + 3..].to_owned(),
-            body: rest.map(|r| text::trim_newlines(r).to_owned()).unwrap_or_default(),
+            body: rest
+                .map(|r| text::trim_newlines(r).to_owned())
+                .unwrap_or_default(),
         })
     }
 }
@@ -306,15 +354,24 @@ impl ToolItem {
     }
 
     pub fn name(&self) -> String {
-        self.call.as_ref().map(|c| c.name.clone()).unwrap_or_else(|| "Tool".to_owned())
+        self.call
+            .as_ref()
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| "Tool".to_owned())
     }
 
     pub fn title(&self) -> String {
-        self.call.as_ref().map(|c| c.title.clone()).unwrap_or_else(|| self.name())
+        self.call
+            .as_ref()
+            .map(|c| c.title.clone())
+            .unwrap_or_else(|| self.name())
     }
 
     pub fn tool_kind(&self) -> ToolKind {
-        self.call.as_ref().map(|c| c.kind).unwrap_or(ToolKind::Other)
+        self.call
+            .as_ref()
+            .map(|c| c.kind)
+            .unwrap_or(ToolKind::Other)
     }
 
     pub fn is_finished(&self) -> bool {
@@ -331,7 +388,11 @@ impl ToolItem {
         if !self.diffs.is_empty() {
             return self.diffs.clone();
         }
-        self.call.as_ref().and_then(DiffBuilder::diff_for_tool).map(|d| vec![d]).unwrap_or_default()
+        self.call
+            .as_ref()
+            .and_then(DiffBuilder::diff_for_tool)
+            .map(|d| vec![d])
+            .unwrap_or_default()
     }
 
     /// The paths it changes, cheaply (no diff is built): the runner's
@@ -341,13 +402,22 @@ impl ToolItem {
             return self.diffs.iter().map(|d| d.path.clone()).collect();
         }
         let input = self.call.as_ref().map(|c| &c.input);
-        if let Some(path) = input.and_then(|i| i.get("file_path").and_then(|v| v.as_str()).or_else(|| i.get("path").and_then(|v| v.as_str()))) {
+        if let Some(path) = input.and_then(|i| {
+            i.get("file_path")
+                .and_then(|v| v.as_str())
+                .or_else(|| i.get("path").and_then(|v| v.as_str()))
+        }) {
             return vec![path.to_owned()];
         }
         input
             .and_then(|i| i.get("paths"))
             .and_then(|v| v.as_array())
-            .map(|paths| paths.iter().filter_map(|p| p.as_str().map(str::to_owned)).collect())
+            .map(|paths| {
+                paths
+                    .iter()
+                    .filter_map(|p| p.as_str().map(str::to_owned))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 }
@@ -372,7 +442,11 @@ pub struct PlanCard {
 
 impl PlanCard {
     pub fn new(item_id: &str, text: &str) -> PlanCard {
-        PlanCard { item_id: item_id.to_owned(), text: text.to_owned(), ..PlanCard::default() }
+        PlanCard {
+            item_id: item_id.to_owned(),
+            text: text.to_owned(),
+            ..PlanCard::default()
+        }
     }
 }
 
@@ -393,8 +467,20 @@ pub struct ApprovalItem {
 }
 
 impl ApprovalItem {
-    pub fn new(request: ApprovalRequest, root: Option<String>, tool_shown: bool, start_request: Option<StartRequest>) -> ApprovalItem {
-        ApprovalItem { request, resolution: None, root, tool_shown, start_request, queued_calls: Vec::new() }
+    pub fn new(
+        request: ApprovalRequest,
+        root: Option<String>,
+        tool_shown: bool,
+        start_request: Option<StartRequest>,
+    ) -> ApprovalItem {
+        ApprovalItem {
+            request,
+            resolution: None,
+            root,
+            tool_shown,
+            start_request,
+            queued_calls: Vec::new(),
+        }
     }
 
     pub fn is_start_request(&self) -> bool {
@@ -414,7 +500,10 @@ impl ApprovalItem {
     }
 
     pub fn set_queued(&mut self, calls: Vec<ApprovalRequest>) {
-        self.queued_calls = calls.into_iter().filter(|c| c.name != StartRequest::CARD_NAME).collect();
+        self.queued_calls = calls
+            .into_iter()
+            .filter(|c| c.name != StartRequest::CARD_NAME)
+            .collect();
     }
 
     /// It shows what it asked: always while it waits (a card then), and
@@ -426,7 +515,10 @@ impl ApprovalItem {
     /// Mike let it happen: the request is now just a step of the work it
     /// allowed, so it folds into the run of work around it.
     pub fn is_allowed(&self) -> bool {
-        matches!(self.resolution.as_ref().map(|r| r.decision), Some(ApprovalDecision::Allow) | Some(ApprovalDecision::AllowAlways))
+        matches!(
+            self.resolution.as_ref().map(|r| r.decision),
+            Some(ApprovalDecision::Allow) | Some(ApprovalDecision::AllowAlways)
+        )
     }
 }
 
@@ -467,7 +559,11 @@ pub enum RowContent {
     Tool(ToolItem),
     /// A tool's pictures, under its row. `generated` is an image the agent
     /// made (Codex's image generation), shown larger than a screenshot.
-    Images { item_id: String, images: Vec<ImageRef>, generated: bool },
+    Images {
+        item_id: String,
+        images: Vec<ImageRef>,
+        generated: bool,
+    },
     Approval(ApprovalItem),
     Question(QuestionItem),
     Secret(SecretItem),
@@ -479,7 +575,10 @@ pub enum RowContent {
     Asks(AsksCard),
     Note(String),
     /// A failed turn's message, and why it failed when the runner said.
-    Error { message: String, kind: Option<TurnErrorKind> },
+    Error {
+        message: String,
+        kind: Option<TurnErrorKind>,
+    },
     Group(WorkGroup),
     Working(WorkingStatus),
     Background(BackgroundStatus),
@@ -502,7 +601,13 @@ impl RowContent {
             RowContent::Assistant(_) => RowKind::Assistant,
             RowContent::Reasoning(_) => RowKind::Reasoning,
             RowContent::Tool(tool) => {
-                if tool.call.as_ref().map(DiffBuilder::is_edit_tool).unwrap_or(false) || !tool.diffs.is_empty() {
+                if tool
+                    .call
+                    .as_ref()
+                    .map(DiffBuilder::is_edit_tool)
+                    .unwrap_or(false)
+                    || !tool.diffs.is_empty()
+                {
                     RowKind::Diff
                 } else {
                     RowKind::Tool
@@ -551,8 +656,12 @@ impl RowContent {
     /// the limit box) stays with them, or the wait note above it would go
     /// on promising a time (Codex's review, 13 Nov).
     pub fn is_login_note(&self) -> bool {
-        let RowContent::Note(text) = self else { return false };
-        let moved = text.starts_with("Moved to ") && text.contains(": ") && !text.contains("The session carries on there");
+        let RowContent::Note(text) = self else {
+            return false;
+        };
+        let moved = text.starts_with("Moved to ")
+            && text.contains(": ")
+            && !text.contains("The session carries on there");
         moved || text.contains(" Carrying on at ") || text.starts_with("Won't carry on by itself")
     }
 
@@ -581,7 +690,7 @@ impl AskNote {
     }
 }
 
-/// A finished turn's asks (`AsksCard`, docs/protocol.md "Needs you"). Only
+/// A finished turn's asks (`AsksCard`, docs/protocol/needs-you.md "Needs you"). Only
 /// the card of the thread's last finished turn is open.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AsksCard {
@@ -621,7 +730,9 @@ impl AsksCard {
     }
 
     pub fn ticked_count(&self) -> usize {
-        (0..self.asks.len() as i64).filter(|i| self.ticked.contains(i)).count()
+        (0..self.asks.len() as i64)
+            .filter(|i| self.ticked.contains(i))
+            .count()
     }
 
     /// A turn that said it needs nothing gets a card too, with no asks: a
@@ -630,4 +741,63 @@ impl AsksCard {
     pub fn is_done(&self) -> bool {
         self.asks.is_empty()
     }
+}
+
+// The rows the model derives rather than reads from events. Their data lives
+// here with the other rows; groups.rs works them out (deslop-please's
+// module-cycle).
+
+/// A run of work inside one turn folded into one line (`WorkGroup`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkGroup {
+    /// Row ids of the folded items, oldest first.
+    pub member_ids: Vec<String>,
+    /// "Read 3 files, searched twice, ran 4 commands".
+    pub summary: String,
+    /// Tool calls in the group that failed.
+    pub failed_count: usize,
+    pub is_expanded: bool,
+    /// The last group of a turn that's still running.
+    pub is_live: bool,
+    /// While live, what's happening now ("Running npm test"), if anything is.
+    pub current_action: Option<String>,
+}
+
+/// The view counts the seconds itself, so the row doesn't change as they
+/// pass.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkingStatus {
+    pub turn_id: String,
+    /// When the turn started (seconds since 1970), if the loaded events say.
+    pub started_at: Option<f64>,
+}
+
+/// The line at the end of a thread whose turn is over but whose CLI still
+/// has sub-agents or jobs running in the background (`BackgroundStatus`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BackgroundStatus {
+    pub tasks: Vec<BackgroundTask>,
+}
+
+/// The "Edited 3 files" card at the end of a turn that changed files
+/// (`ChangedFiles`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChangedFiles {
+    pub turn_id: String,
+    pub files: Vec<ChangedFile>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChangedFile {
+    pub path: String,
+    pub added: i64,
+    pub removed: i64,
+    /// Every successful edit to the file in the turn, in order.
+    pub diffs: Vec<EditDiff>,
+    /// Its diff is open under it in the card.
+    pub is_expanded: bool,
+    /// Its open diff shows every line, not just the first few.
+    pub shows_all: bool,
+    /// The thread's working folder.
+    pub root: Option<String>,
 }

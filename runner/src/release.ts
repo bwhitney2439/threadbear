@@ -77,9 +77,18 @@ function updateState(home: string, change: (s: RunnerState) => boolean): boolean
 }
 
 // The release <home>/runner/current names, if there's a link.
-export function currentLink(home: string): string | undefined {
+// On Windows it's a text file with the release's id (launch.mjs's
+// readCurrentLink says why).
+export function currentLink(home: string, platform: NodeJS.Platform = process.platform): string | undefined {
+  const file = path.join(home, 'runner', 'current');
   try {
-    return path.basename(fs.readlinkSync(path.join(home, 'runner', 'current')));
+    return path.basename(fs.readlinkSync(file));
+  } catch {
+    if (platform !== 'win32') return undefined;
+  }
+  try {
+    const id = fs.readFileSync(file, 'utf8').trim();
+    return id && !/[\\/]/.test(id) ? id : undefined;
   } catch {
     return undefined;
   }
@@ -87,6 +96,30 @@ export function currentLink(home: string): string | undefined {
 
 export function releaseExists(home: string, id: string): boolean {
   return fs.existsSync(path.join(home, 'runner', 'releases', id, 'src', 'main.ts'));
+}
+
+// The data dir a release's code sits in (<home>/runner/releases/<id>), or
+// undefined for code run from a checkout.
+export function releaseHome(root = CODE_ROOT): string | undefined {
+  const releases = path.dirname(root);
+  if (path.basename(releases) !== 'releases' || path.basename(path.dirname(releases)) !== 'runner' || !readRelease(root)) return undefined;
+  return path.dirname(path.dirname(releases));
+}
+
+// When this code is a release's but <home>/runner/current names another
+// one: a CLI keeps the PATH it started with, so before 24 Nov a thread
+// started yesterday ran yesterday's tb, and its `tb land` refused with a
+// hold main had already taken out. threadBinDir (restart.ts) fixes that
+// on macOS and Linux; this is for tb to say so where it still happens (on
+// Windows, or a release's tb run by its full path). `tb` is the one to run.
+export function staleRelease(root = CODE_ROOT, platform: NodeJS.Platform = process.platform): { mine: string; current: string; tb: string } | undefined {
+  const home = releaseHome(root);
+  if (!home) return undefined;
+  const mine = path.basename(root);
+  const current = currentLink(home, platform);
+  if (!current || current === mine || !releaseExists(home, current)) return undefined;
+  const tb = platform === 'win32' ? path.join(home, 'runner', 'releases', current, 'bin', 'tb.cmd') : path.join(home, 'runner', 'current', 'bin', 'tb');
+  return { mine, current, tb };
 }
 
 // Points current at a release the way launch.mjs and deploy-runner.sh do
@@ -97,7 +130,8 @@ export function pointCurrentAt(home: string, id: string): void {
   const link = path.join(home, 'runner', 'current');
   const tmp = `${link}.${process.pid}.tmp`;
   fs.rmSync(tmp, { force: true });
-  fs.symlinkSync(path.join('releases', id), tmp);
+  if (process.platform === 'win32') fs.writeFileSync(tmp, id + '\n');
+  else fs.symlinkSync(path.join('releases', id), tmp);
   fs.renameSync(tmp, link);
   updateState(home, (s) => {
     s.current = id;
@@ -292,4 +326,22 @@ export function onSupervisorGone(fn: () => void): () => void {
   // keeps the process alive anyway, so let the channel not hold it.
   (process.channel as { unref?: () => void } | undefined)?.unref?.();
   return () => process.off('disconnect', handler);
+}
+
+// Calls fn once when the supervisor asks this runner to stop over IPC
+// ({ type: 'stop' }), which is how launch.mjs stops it on Windows: there
+// SIGTERM is a hard kill, so the runner would never save its threads or
+// stop its CLIs. Elsewhere launch.mjs sends SIGTERM as before. Returns an
+// unsubscribe; does nothing when not supervised.
+export function onStopRequest(fn: () => void): () => void {
+  if (!supervised()) return () => {};
+  let called = false;
+  const handler = (m: unknown) => {
+    if (called || !m || typeof m !== 'object' || (m as { type?: unknown }).type !== 'stop') return;
+    called = true;
+    fn();
+  };
+  process.on('message', handler);
+  (process.channel as { unref?: () => void } | undefined)?.unref?.();
+  return () => process.off('message', handler);
 }

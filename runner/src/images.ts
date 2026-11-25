@@ -4,11 +4,21 @@
 // `convert` on ImageMagick 6) for pictures and rsvg-convert for SVG
 // instead, which INSTALL.md ("A runner on Linux") installs. Without them every call here fails the
 // way a picture sips couldn't read does, so callers keep their fallbacks.
+// On Windows a hidden powershell.exe converts each with Windows' own
+// imaging (win-image.ps1), about a second a picture; SVG isn't drawn there.
 import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { powershellPath } from './win32-helper.ts';
 
 const MAC = process.platform === 'darwin';
+const WINDOWS = process.platform === 'win32';
+
+// win-image.ps1 as the runner found it when it first converted a picture.
+let winScript: string | undefined;
+function winImageScript(): string {
+  return (winScript ??= fs.readFileSync(path.join(import.meta.dirname, 'win-image.ps1'), 'utf8'));
+}
 
 export interface ConvertOptions {
   format: 'png' | 'jpeg';
@@ -16,6 +26,10 @@ export interface ConvertOptions {
   quality?: number;
   // Shrinks the picture to fit this many pixels on its longer side.
   maxPx?: number;
+  // ImageMagick only: refuse to decode a picture over this many pixels a side
+  // or in all (project icons, icon-budget.ts); sips has no such setting, and
+  // the icon's own headers are checked before either sees it.
+  decodeLimit?: { side: number; pixels: number };
 }
 
 // The first of `names` on PATH, or undefined. Looked up once per name.
@@ -97,8 +111,24 @@ export function convertCommand(src: string, out: string, o: ConvertOptions): [st
       ],
     ];
   }
+  if (WINDOWS) {
+    try {
+      return winCommand(src, out, o, winImageScript());
+    } catch {
+      return undefined;
+    }
+  }
   const magick = onPath('magick', 'convert');
   return magick ? magickCommand(magick, src, out, o) : undefined;
+}
+
+// Windows' command for it: win-image.ps1 with what to do in front, passed
+// whole as -EncodedCommand. Only a picture by its bytes, as for ImageMagick.
+export function winCommand(src: string, out: string, o: ConvertOptions, script: string, powershell = powershellPath()): [string, string[]] | undefined {
+  const kind = pictureKindOf(src);
+  if (!kind || kind === 'icns') return undefined;
+  const p = Buffer.from([src, out, o.format, String(o.quality ?? 0), String(o.maxPx ?? 0)].join('\0'), 'utf8').toString('base64');
+  return [powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from(`$p = '${p}'\n${script}`, 'utf16le').toString('base64')]];
 }
 
 // ImageMagick's command for it. Nothing that isn't a picture by its bytes
@@ -109,6 +139,9 @@ export function magickCommand(magick: string, src: string, out: string, o: Conve
   return [
     magick,
     [
+      ...(o.decodeLimit
+        ? ['-limit', 'width', String(o.decodeLimit.side), '-limit', 'height', String(o.decodeLimit.side), '-limit', 'area', String(o.decodeLimit.pixels), '-limit', 'memory', '256MiB', '-limit', 'map', '512MiB']
+        : []),
       // The decoder named, so ImageMagick never picks one itself; [0]: the
       // first frame or page only, as sips does for a GIF or TIFF.
       `${kind}:${src}[0]`,
@@ -127,14 +160,14 @@ export function magickCommand(magick: string, src: string, out: string, o: Conve
 export function convertImageSync(src: string, out: string, o: ConvertOptions, timeoutMs = 30_000): void {
   const cmd = convertCommand(src, out, o);
   if (!cmd) throw new Error('No image converter on this machine (sips, or ImageMagick on Linux)');
-  execFileSync(cmd[0], cmd[1], { stdio: 'ignore', timeout: timeoutMs });
+  execFileSync(cmd[0], cmd[1], { stdio: 'ignore', timeout: timeoutMs, windowsHide: true });
 }
 
 // convertImageSync without blocking: true when `out` was made.
 export function convertImage(src: string, out: string, o: ConvertOptions, timeoutMs = 20_000): Promise<boolean> {
   const cmd = convertCommand(src, out, o);
   if (!cmd) return Promise.resolve(false);
-  return new Promise((resolve) => execFile(cmd[0], cmd[1], { timeout: timeoutMs }, (err) => resolve(!err && fs.existsSync(out))));
+  return new Promise((resolve) => execFile(cmd[0], cmd[1], { timeout: timeoutMs, windowsHide: true }, (err) => resolve(!err && fs.existsSync(out))));
 }
 
 // Draws an SVG to a PNG at `out`, fitting `px` square. Quick Look on macOS,

@@ -18,12 +18,17 @@ export type Row = {
   /** A reply's ```slack, ```email and ```draft boxes as drawn: the label, each
    * line, each formatted piece ("bold: Hi", "link: docs <https://x.dev>") and
    * what Copy says ("Copy" or "Copied"). */
-  drafts?: { label: string; lines: string[]; styled: string[]; copy: string }[];
+  drafts?: { label: string; lines: string[]; styled: string[]; copy: string; edited?: boolean; editing?: boolean }[];
   /** A reply's closed ```bash blocks and their icons: "[put, copy] npm test", or "[copy] npm test". */
   shellBlocks?: string[];
   /** The chips a row draws among its words: "picture: Picture 1", "card:
    * Fix the button", "thread: Morning brief". */
   chips?: string[];
+  /** My message's changed drafts, drawn as chips under its words (GPUI):
+   * the words it shows and each chip's label. */
+  editedDrafts?: { words: string; chips: string[] };
+  /** The web addresses my bubble draws as links (GPUI). */
+  links?: string[];
   /** A gap row's words as drawn, from the row's own top, while it's on screen. */
   label?: { top: number; height: number };
 };
@@ -75,7 +80,7 @@ export type Dump = {
   };
   /** The line under the bar when the thread can't go on where it is (LimitBanner). */
   limit?: { text: string; button?: string | null; carryOn?: string | null } | null;
-  composer: { draft: string; text: string; images?: number; editing?: number | null; chip?: string; chipBadge?: string | null; mode?: string; card?: string[] | null; cwd?: string; runner?: string | null; creating?: boolean };
+  composer: { draft: string; text: string; images?: number; editing?: number | null; chip?: string; chipBadge?: string | null; mode?: string; card?: string[] | null; drafts?: string[]; cwd?: string; runner?: string | null; creating?: boolean };
   /** The new-thread page while it's showing. */
   newThread?: { heading: string; note: string; project?: string | null; rooms: { label: string; line: string; selected: boolean; note?: string | null }[] } | null;
   /** The slash palette over the composer while it's open. */
@@ -88,11 +93,13 @@ export type Dump = {
     detail?: { title: string; usage: string; description?: string | null; now?: string | null; also?: string | null; origin: string; path?: string | null; buttons: string[] } | null;
     note?: string | null;
   } | null;
+  /** The # thread picker over the composer while it's open (GPUI only). */
+  threadPicker?: { query: string; threads: { id: string; title: string; folder: string }[]; picked?: string | null } | null;
   /** ⌘K's box while it's up: what's typed, each group's entries as their
    *  lines read ("Inbox | ⌘1"), and the pick's title. */
   anything?: { query: string; groups: { title: string; items: string[] }[]; picked?: string | null; recent: string[] } | null;
   /** The Move sheet while it's up. */
-  moveSheet?: { title: string; subtitle: string; folder: string; login: string; problems: string[]; leftBehind: string[]; clone?: string | null; asking: boolean; canMove: boolean } | null;
+  moveSheet?: { title: string; subtitle: string; folder: string; login: string; problems: string[]; leftBehind: string[]; clone?: string | null; cloneFrom?: string | null; asking: boolean; canMove: boolean } | null;
   decisions?: string[] | null;
   transcript: {
     threadId?: string;
@@ -103,6 +110,8 @@ export type Dump = {
     hasMoreAbove?: boolean;
     /** The spinner in the middle while it's read (the GPUI app's; the Swift dump has only `state`). */
     spinner?: boolean;
+    /** The find bar over the transcript while it's up (GPUI only): its line ("upload: 2 of 5") and the row with the picked match. */
+    threadFind?: { line: string; row: string | null } | null;
     rows: Row[];
   };
   banner?: { style: string; text: string; detail?: string } | null;
@@ -115,7 +124,7 @@ export type Dump = {
   /** The Threads panel is on screen: in the layout and not folded away with ⌘/. */
   threadsShowing?: boolean;
   /** Threads open in panels of their own: whether each one's tab is showing, and its transcript. */
-  threadPanels?: { id: string; title: string; showing: boolean; transcript?: Dump['transcript'] | null }[];
+  threadPanels?: { id: string; title: string; showing: boolean; transcript?: Dump['transcript'] | null; mode?: string | null; archived?: boolean }[];
   /** The thread the main panel says is open in its own panel. */
   openElsewhere?: string | null;
   /** The keys shown beside the buttons while ⌘ is held ("Threads ⌘1"). */
@@ -138,7 +147,18 @@ export type Dump = {
   opening?: { thread: string; how: string; boxDrop: number | null } | null;
   /** The small motions as last seen (GPUI only): the row a click last slid
    * off, and the card that last arrived while its thread was on screen. */
-  juice?: { slidOff: string | null; cardArrived: number | null } | null;
+  /** `confetti`: the last burst asked for, from which anchor, and whether it's popped (its anchor was drawn). */
+  juice?: {
+    slidOff: string | null;
+    cardArrived: number | null;
+    confetti?: { anchor: string; popped: boolean } | null;
+    /** The answer whose button last filled, as "ask:option" from 0. */
+    answerFilled?: string | null;
+    /** How many pictures have dropped into the box. */
+    picturesDropped?: number | null;
+    /** How long a streaming reply's new words take to fade in; 0 under Reduce Motion. */
+    replyFadeMs?: number;
+  } | null;
   /** The last time the panels moved with their glide: where each panel was
    * drawn and where it is (or, in the GPUI app, is going), by panel
    * ("thread", "terminal"), and whether it's still moving (GPUI only). */
@@ -176,10 +196,12 @@ export type Rect = { x: number; y: number; width: number; height: number };
 export type Flight = { to: 'archive' | 'hibernate'; thread?: string | null; start: Rect; end?: { x: number; y: number } | null; onHeading: boolean; landed: boolean; landedBox?: Rect | null };
 
 /** `dot` is the accent dot (something only you can do), `quietDot` the grey one. */
-export type RailButton = { title: string; badge?: number | null; dot?: boolean; quietDot?: boolean; active: boolean };
+/** `nextVersion` (Updates only): what its icon shows of the next version, a turning ring while it's on its way and green once it's ready. */
+export type RailButton = { title: string; badge?: number | null; dot?: boolean; quietDot?: boolean; nextVersion?: 'none' | 'coming' | 'ready'; active: boolean };
 
 /** One of the activity bar's panels: whether it's on show, and what it says. */
-export type PanelLines = { shown: boolean; lines: string[] };
+/** `docked`: in the layout, in front of its tab group or behind another tab (GPUI only). */
+export type PanelLines = { shown: boolean; docked?: boolean; lines: string[] };
 
 export interface Driver {
   readonly name: 'swift' | 'gpui';
